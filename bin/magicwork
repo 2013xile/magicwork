@@ -1,0 +1,1591 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const { spawnSync, spawn } = require('child_process');
+
+const DEFAULT_REPO = '/Users/xile/code/nocobase/nocobase';
+const DEFAULT_SOCKET = 'unix:/tmp/kitty.sock';
+const TEMPLATE_TASK_COUNT = 5;
+const ACTIVE_STATE_FILE = '.magicwork-active.json';
+const RECORDS_DIR = 'records';
+const PREFERRED_NODE_BIN_DIR = path.join(process.env.HOME || '', '.nvm/versions/node/v22.18.0/bin');
+const CODEX_NOTIFY_SCRIPT = path.join(__dirname, 'codex_notify.py');
+const CODEX_WATCHER_SCRIPT = path.join(__dirname, 'kitty_codex_watcher.py');
+
+main();
+
+function main() {
+  const args = process.argv.slice(2);
+  const command = args[0];
+
+  try {
+    switch (command) {
+      case 'init':
+        runInit(args.slice(1));
+        break;
+      case 'run':
+        runLaunch(args.slice(1));
+        break;
+      case 'restore':
+        runRestore(args.slice(1));
+        break;
+      case 'clean':
+        runClean(args.slice(1));
+        break;
+      case 'report':
+        runReport(args.slice(1));
+        break;
+      case 'bootstrap-nocobase':
+        runBootstrapNocoBase(args.slice(1));
+        break;
+      case 'help':
+      case '--help':
+      case '-h':
+      case undefined:
+        printHelp();
+        break;
+      default:
+        fail(`Unsupported command: ${command}`);
+    }
+  } catch (error) {
+    fail(error.message || String(error));
+  }
+}
+
+function runInit(args) {
+  const options = parseOptions(args);
+  const date = options.date || todayLocal();
+  const cwd = process.cwd();
+  const dayDir = path.join(cwd, date);
+
+  ensureDir(dayDir);
+
+  const filePath = nextTaskFile(dayDir);
+  const defaultBaseBranch = detectCurrentBranch(DEFAULT_REPO) || 'main';
+  const template = buildTemplate({
+    date,
+    defaultRepo: DEFAULT_REPO,
+    defaultBaseBranch,
+    activeTasks: options.noCarryActive ? [] : readActiveTasks(cwd),
+  });
+
+  fs.writeFileSync(filePath, template, 'utf8');
+  console.log(filePath);
+}
+
+function runLaunch(args) {
+  const options = parseOptions(args);
+  const inputPath = options._[0] ? path.resolve(options._[0]) : resolveDefaultTaskFile(options.date);
+  if (!fs.existsSync(inputPath)) {
+    fail(`Task file not found: ${inputPath}`);
+  }
+
+  const content = fs.readFileSync(inputPath, 'utf8');
+  const context = parseTaskFile(content, inputPath);
+  if (!context.tasks.length) {
+    fail(`No runnable tasks found in ${inputPath}`);
+  }
+
+  const socketAddress = resolveKittySocket(options.socket);
+  if (!options.dryRun) {
+    ensureKittyServer(socketAddress);
+  }
+
+  const allResolvedTasks = context.tasks.map((task) => resolveTask(context, task));
+  const activeBranches = new Set(readActiveTasks(process.cwd()).map((task) => task.newBranch));
+  const tasksToLaunch = options.rerunLaunched
+    ? allResolvedTasks
+    : allResolvedTasks.filter((task) => !activeBranches.has(task.newBranch));
+  const skippedTasks = options.rerunLaunched
+    ? []
+    : allResolvedTasks.filter((task) => activeBranches.has(task.newBranch));
+
+  if (!tasksToLaunch.length) {
+    console.log(`run: using ${inputPath}`);
+    console.log('run: no new tasks to launch');
+    for (const task of skippedTasks) {
+      console.log(`run: skipped already launched task ${task.index} ${task.name}`);
+    }
+    return;
+  }
+
+  const runtimeConfigs = planNocoBaseRuntimeConfigs(tasksToLaunch, process.cwd());
+  const launched = [];
+  for (const resolved of tasksToLaunch) {
+    let shouldBootstrapNocoBase = false;
+    const runtimeConfig = runtimeConfigs.get(resolved.newBranch) || null;
+    if (!options.dryRun) {
+      const created = ensureWorktree(resolved);
+      shouldBootstrapNocoBase = created && resolved.initEnv !== false && isNocoBaseRepo(resolved.worktreePath);
+      launchKittyTab(resolved, socketAddress, { shouldBootstrapNocoBase, runtimeConfig });
+    }
+    launched.push(resolved);
+  }
+
+  for (const task of launched) {
+    console.log(`${task.index}. ${task.name}`);
+    console.log(`   repo: ${task.repo}`);
+    console.log(`   base: ${task.baseBranch}`);
+    console.log(`   branch: ${task.newBranch}`);
+    console.log(`   worktree: ${task.worktreePath}`);
+    if (options.dryRun) {
+      console.log('   mode: dry-run');
+    }
+  }
+
+  for (const task of skippedTasks) {
+    console.log(`${task.index}. ${task.name}`);
+    console.log(`   branch: ${task.newBranch}`);
+    console.log(`   worktree: ${task.worktreePath}`);
+    console.log('   status: skipped already launched');
+  }
+
+  if (!options.dryRun) {
+    upsertActiveTasks(process.cwd(), launched, context.date);
+  }
+}
+
+function runClean(args) {
+  const options = parseOptions(args);
+  const inputPath = options._[0] && options._[0].endsWith('.md')
+    ? path.resolve(options._.shift())
+    : resolveDefaultTaskFile(options.date);
+
+  if (!fs.existsSync(inputPath)) {
+    fail(`Task file not found: ${inputPath}`);
+  }
+
+  const content = fs.readFileSync(inputPath, 'utf8');
+  const context = parseTaskFile(content, inputPath);
+  const tasks = context.tasks.map((task) => resolveTask(context, task));
+
+  if (!tasks.length) {
+    fail(`No runnable tasks found in ${inputPath}`);
+  }
+
+  const targets = options.all ? tasks : resolveCleanTargets(tasks, options._);
+  if (!targets.length) {
+    fail('No matching worktrees to clean');
+  }
+
+  console.log(`clean: using ${inputPath}`);
+  console.log(`clean: matched ${targets.length} task(s)`);
+  for (const task of targets) {
+    if (options.dryRun) {
+      console.log(`${task.index}. ${task.name}`);
+      console.log(`   branch: ${task.newBranch}`);
+      console.log(`   worktree: ${task.worktreePath}`);
+      console.log('   mode: dry-run');
+      continue;
+    }
+
+    console.log(`clean: start task ${task.index} ${task.name}`);
+    console.log(`clean: removing worktree ${task.worktreePath}`);
+    removeWorktreeAndBranch(task, logCleanStep);
+    if (isNocoBaseRepo(task.repo) || isNocoBaseRepo(task.worktreePath)) {
+      const mainDbName = formatDatabaseName(task.newBranch || task.slug);
+      const testDbName = `${mainDbName}_test`.slice(0, 63);
+      console.log(`clean: removing database ${mainDbName}`);
+      dropPostgresDatabase(mainDbName);
+      console.log(`clean: removing database ${testDbName}`);
+      dropPostgresDatabase(testDbName);
+    }
+    console.log(`clean: removing active state ${task.newBranch}`);
+    removeActiveTasks(process.cwd(), [task.newBranch]);
+    console.log(`clean: finished task ${task.index} ${task.name}`);
+    console.log(`${task.index}. ${task.name}`);
+    console.log(`   removed branch: ${task.newBranch}`);
+    console.log(`   removed worktree: ${task.worktreePath}`);
+  }
+}
+
+function runRestore(args) {
+  const options = parseOptions(args);
+  const socketAddress = resolveKittySocket(options.socket);
+  const activeTasks = readActiveTasks(process.cwd());
+
+  if (!activeTasks.length) {
+    console.log('restore: no active tasks');
+    return;
+  }
+
+  const resolvedActiveTasks = [];
+  for (let index = 0; index < activeTasks.length; index += 1) {
+    const activeTask = activeTasks[index];
+    const worktreePath = findWorktreePathByBranch(activeTask.repo, activeTask.newBranch);
+    resolvedActiveTasks.push({
+      index: index + 1,
+      name: activeTask.name,
+      repo: activeTask.repo,
+      baseBranch: activeTask.baseBranch || detectCurrentBranch(activeTask.repo) || 'main',
+      newBranch: activeTask.newBranch,
+      initEnv: activeTask.initEnv,
+      prompt: activeTask.prompt,
+      slug: slugify(activeTask.name, index + 1),
+      worktreePath,
+    });
+  }
+
+  const targets = options.all || !options._.length
+    ? resolvedActiveTasks
+    : resolveCleanTargets(resolvedActiveTasks, options._);
+
+  if (!targets.length) {
+    console.log('restore: no matching worktrees to reopen');
+    return;
+  }
+
+  if (!options.dryRun) {
+    ensureKittyServer(socketAddress);
+  }
+
+  const restored = [];
+  for (const task of targets) {
+    if (!task.worktreePath) {
+      console.log(`restore: skipped ${task.name} (${task.newBranch}), worktree not found`);
+      continue;
+    }
+    if (!options.dryRun) {
+      launchKittyTab(task, socketAddress, {
+        shouldBootstrapNocoBase: false,
+        sendPrompt: false,
+      });
+    }
+    restored.push(task);
+  }
+
+  if (!restored.length) {
+    console.log('restore: no matching worktrees to reopen');
+    return;
+  }
+
+  for (const task of restored) {
+    console.log(`${task.index}. ${task.name}`);
+    console.log(`   branch: ${task.newBranch}`);
+    console.log(`   worktree: ${task.worktreePath}`);
+    if (options.dryRun) {
+      console.log('   mode: dry-run');
+    }
+  }
+}
+
+function runReport(args) {
+  const options = parseOptions(args);
+  const inputPath = options._[0] && options._[0].endsWith('.md')
+    ? path.resolve(options._.shift())
+    : resolveDefaultTaskFile(options.date);
+
+  if (!fs.existsSync(inputPath)) {
+    fail(`Task file not found: ${inputPath}`);
+  }
+
+  const content = fs.readFileSync(inputPath, 'utf8');
+  const context = parseTaskFile(content, inputPath);
+  const tasks = context.tasks.map((task) => resolveTask(context, task));
+
+  if (!tasks.length) {
+    fail(`No runnable tasks found in ${inputPath}`);
+  }
+
+  const targets = options.all ? tasks : resolveCleanTargets(tasks, options._);
+  if (!targets.length) {
+    fail('No matching worktrees to report');
+  }
+
+  for (const task of targets) {
+    const recordPath = taskRecordPath(process.cwd(), task);
+    if (options.dryRun) {
+      console.log(`${task.index}. ${task.name}`);
+      console.log(`   record: ${recordPath}`);
+      console.log(`   worktree: ${task.worktreePath}`);
+      console.log('   mode: dry-run');
+      continue;
+    }
+
+    if (!fs.existsSync(task.worktreePath) || !isGitRepo(task.worktreePath)) {
+      throw new Error(`Worktree does not exist for ${task.name}: ${task.worktreePath}`);
+    }
+
+    ensureDir(path.dirname(recordPath));
+    const reportMarkdown = generateTaskReport(task);
+    appendTaskRecord(recordPath, task, reportMarkdown);
+    updateActiveTaskSummary(process.cwd(), task.newBranch, reportMarkdown);
+
+    console.log(`${task.index}. ${task.name}`);
+    console.log(`   record: ${recordPath}`);
+    console.log(`   worktree: ${task.worktreePath}`);
+  }
+}
+
+function runBootstrapNocoBase(args) {
+  const options = parseOptions(args);
+  const worktreePath = options.worktree ? path.resolve(options.worktree) : '';
+  const repoPath = options.repo ? path.resolve(options.repo) : '';
+  const newBranch = options.branch || '';
+  const slug = options.slug || slugify(path.basename(worktreePath || 'task'), 1);
+  const taskName = options.name || path.basename(worktreePath || 'task');
+  const runtimeConfig = {
+    mainDbName: options.dbName || '',
+    testDbName: options.testDbName || '',
+    appPort: options.appPort || '',
+    testAppPort: options.testAppPort || '',
+    inspectPort: options.inspectPort || '',
+  };
+
+  if (!worktreePath || !repoPath || !newBranch) {
+    fail('bootstrap-nocobase requires --worktree, --repo and --branch');
+  }
+
+  console.log(`[bootstrap] start ${taskName}`);
+  console.log(`[bootstrap] worktree ${worktreePath}`);
+  console.log(`[bootstrap] repo ${repoPath}`);
+  console.log(`[bootstrap] branch ${newBranch}`);
+  initializeNocoBaseWorktree({
+    name: taskName,
+    worktreePath,
+    repo: repoPath,
+    newBranch,
+    slug,
+    runtimeConfig,
+  });
+}
+
+function parseOptions(args) {
+  const options = { _: [] };
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (token === '--date') {
+      options.date = args[++index];
+      continue;
+    }
+    if (token === '--socket') {
+      options.socket = args[++index];
+      continue;
+    }
+    if (token === '--dry-run') {
+      options.dryRun = true;
+      continue;
+    }
+    if (token === '--all') {
+      options.all = true;
+      continue;
+    }
+    if (token === '--no-carry-active') {
+      options.noCarryActive = true;
+      continue;
+    }
+    if (token === '--worktree') {
+      options.worktree = args[++index];
+      continue;
+    }
+    if (token === '--repo') {
+      options.repo = args[++index];
+      continue;
+    }
+    if (token === '--branch') {
+      options.branch = args[++index];
+      continue;
+    }
+    if (token === '--slug') {
+      options.slug = args[++index];
+      continue;
+    }
+    if (token === '--name') {
+      options.name = args[++index];
+      continue;
+    }
+    if (token === '--db-name') {
+      options.dbName = args[++index];
+      continue;
+    }
+    if (token === '--test-db-name') {
+      options.testDbName = args[++index];
+      continue;
+    }
+    if (token === '--app-port') {
+      options.appPort = args[++index];
+      continue;
+    }
+    if (token === '--test-app-port') {
+      options.testAppPort = args[++index];
+      continue;
+    }
+    if (token === '--inspect-port') {
+      options.inspectPort = args[++index];
+      continue;
+    }
+    if (token === '--rerun-launched') {
+      options.rerunLaunched = true;
+      continue;
+    }
+    options._.push(token);
+  }
+  return options;
+}
+
+function todayLocal() {
+  const now = new Date();
+  const year = String(now.getFullYear());
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function nextTaskFile(dayDir) {
+  const entries = fs
+    .readdirSync(dayDir)
+    .filter((entry) => /^tasks(?:-\d{2})?\.md$/.test(entry))
+    .sort();
+
+  if (!entries.length) {
+    return path.join(dayDir, 'tasks.md');
+  }
+
+  let number = 2;
+  while (true) {
+    const candidate = `tasks-${String(number).padStart(2, '0')}.md`;
+    const candidatePath = path.join(dayDir, candidate);
+    if (!fs.existsSync(candidatePath)) {
+      return candidatePath;
+    }
+    number += 1;
+  }
+}
+
+function buildTemplate({ date, defaultRepo, defaultBaseBranch, activeTasks }) {
+  const tasks = [];
+  const taskCount = Math.max(TEMPLATE_TASK_COUNT, activeTasks.length);
+
+  for (let index = 1; index <= taskCount; index += 1) {
+    const activeTask = activeTasks[index - 1];
+    tasks.push(renderTaskBlock(index, activeTask, defaultRepo, defaultBaseBranch));
+  }
+
+  return [
+    `# Daily Workflow ${date}`,
+    '',
+    '填写规则：',
+    '- `Enabled` 改成 `yes` 才会执行。',
+    '- `Workdir` 是源仓库目录；为空时默认 `/Users/xile/code/nocobase/nocobase`。',
+    '- `BaseBranch` 是创建 worktree 的起点分支；为空时取源仓库当前分支。',
+    '- `NewBranch` 可选；为空时自动生成 `magicwork/<date>/<task>` 新分支。',
+    '- `InitEnv` 控制是否初始化环境，默认 `yes`。',
+    '- `init` 默认会把未清理的 active 任务带到新一天；用 `--no-carry-active` 可关闭。',
+    '- prompt 写给新开 tab 里的 `codex` 作为初始提示词。',
+    '',
+    ...tasks,
+  ].join('\n');
+}
+
+function renderTaskBlock(index, activeTask, defaultRepo, defaultBaseBranch) {
+  if (activeTask) {
+    return [
+      `## Task ${index}`,
+      '',
+      `- Name: ${activeTask.name}`,
+      '- Enabled: yes',
+      `- Workdir: ${activeTask.repo || defaultRepo}`,
+      `- BaseBranch: ${activeTask.baseBranch || defaultBaseBranch}`,
+      `- NewBranch: ${activeTask.newBranch || ''}`,
+      `- InitEnv: ${activeTask.initEnv === false ? 'no' : 'yes'}`,
+      '',
+      '```prompt',
+      activeTask.prompt || 'Fill the prompt for this task.',
+      '```',
+      '',
+    ].join('\n');
+  }
+
+  return [
+    `## Task ${index}`,
+    '',
+    `- Name: Task ${index}`,
+    '- Enabled: no',
+    `- Workdir: ${defaultRepo}`,
+    `- BaseBranch: ${defaultBaseBranch}`,
+    '- NewBranch: ',
+    '- InitEnv: yes',
+    '',
+    '```prompt',
+    'Fill the prompt for this task.',
+    '```',
+    '',
+  ].join('\n');
+}
+
+function resolveDefaultTaskFile(dateArg) {
+  const date = dateArg || todayLocal();
+  const dayDir = path.join(process.cwd(), date);
+  if (!fs.existsSync(dayDir)) {
+    fail(`Date directory not found: ${dayDir}`);
+  }
+
+  const entries = fs
+    .readdirSync(dayDir)
+    .filter((entry) => /^tasks(?:-\d{2})?\.md$/.test(entry))
+    .sort();
+
+  if (!entries.length) {
+    fail(`No task markdown files found in ${dayDir}`);
+  }
+
+  return path.join(dayDir, entries[entries.length - 1]);
+}
+
+function parseTaskFile(content, filePath) {
+  const dateMatch = filePath.match(/(\d{4}-\d{2}-\d{2})/);
+  const date = dateMatch ? dateMatch[1] : todayLocal();
+  const dayDir = path.dirname(filePath);
+  const sections = content.split(/^## Task \d+\s*$/m).slice(1);
+  const tasks = [];
+
+  sections.forEach((section, sectionIndex) => {
+    const fields = parseFields(section);
+    const prompt = parsePrompt(section);
+    const enabled = parseBoolean(fields.Enabled || 'no');
+    if (!enabled) {
+      return;
+    }
+    if (!prompt.trim()) {
+      throw new Error(`Task ${sectionIndex + 1} is enabled but prompt is empty`);
+    }
+
+    tasks.push({
+      index: sectionIndex + 1,
+      name: fields.Name || `Task ${sectionIndex + 1}`,
+      repo: fields.Workdir || DEFAULT_REPO,
+      baseBranch: fields.BaseBranch || '',
+      newBranch: fields.NewBranch || '',
+      initEnv: fields.InitEnv ? parseBoolean(fields.InitEnv) : true,
+      prompt: prompt.trim(),
+    });
+  });
+
+  return { date, dayDir, tasks };
+}
+
+function activeStatePath(rootDir) {
+  return path.join(rootDir, ACTIVE_STATE_FILE);
+}
+
+function readActiveTasks(rootDir) {
+  const statePath = activeStatePath(rootDir);
+  if (!fs.existsSync(statePath)) {
+    return [];
+  }
+
+  const raw = fs.readFileSync(statePath, 'utf8').trim();
+  if (!raw) {
+    return [];
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Failed to parse ${statePath}`);
+  }
+
+  const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+  return tasks.filter((task) => {
+    return task
+      && typeof task.name === 'string'
+      && typeof task.repo === 'string'
+      && typeof task.newBranch === 'string'
+      && typeof task.prompt === 'string';
+  });
+}
+
+function writeActiveTasks(rootDir, tasks) {
+  const statePath = activeStatePath(rootDir);
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    tasks,
+  };
+  fs.writeFileSync(statePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
+
+function upsertActiveTasks(rootDir, tasks, date) {
+  const existing = readActiveTasks(rootDir);
+  const byBranch = new Map(existing.map((task) => [task.newBranch, task]));
+
+  for (const task of tasks) {
+    byBranch.set(task.newBranch, {
+      name: task.name,
+      repo: task.repo,
+      baseBranch: task.baseBranch,
+      newBranch: task.newBranch,
+      initEnv: task.initEnv,
+      prompt: task.prompt,
+      lastDate: date,
+    });
+  }
+
+  writeActiveTasks(rootDir, Array.from(byBranch.values()));
+}
+
+function removeActiveTasks(rootDir, branchNames) {
+  const existing = readActiveTasks(rootDir);
+  const blocked = new Set(branchNames);
+  const nextTasks = existing.filter((task) => !blocked.has(task.newBranch));
+  writeActiveTasks(rootDir, nextTasks);
+}
+
+function updateActiveTaskSummary(rootDir, branchName, reportMarkdown) {
+  const existing = readActiveTasks(rootDir);
+  let changed = false;
+  const nextTasks = existing.map((task) => {
+    if (task.newBranch !== branchName) {
+      return task;
+    }
+    changed = true;
+    return {
+      ...task,
+      lastSummary: extractSection(reportMarkdown, '### Summary'),
+      lastNext: extractSection(reportMarkdown, '### Next'),
+      lastReportedAt: new Date().toISOString(),
+    };
+  });
+
+  if (changed) {
+    writeActiveTasks(rootDir, nextTasks);
+  }
+}
+
+function parseFields(section) {
+  const fields = {};
+  const matches = section.matchAll(/^- ([A-Za-z]+):[ \t]*([^\n]*)$/gm);
+  for (const match of matches) {
+    fields[match[1]] = match[2].trim();
+  }
+  return fields;
+}
+
+function parsePrompt(section) {
+  const match = section.match(/```prompt\s*\n([\s\S]*?)\n```/);
+  return match ? match[1] : '';
+}
+
+function parseBoolean(value) {
+  return ['1', 'true', 'yes', 'y', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function resolveTask(context, task) {
+  const repo = path.resolve(task.repo || DEFAULT_REPO);
+  if (!isGitRepo(repo)) {
+    throw new Error(`Not a git repository: ${repo}`);
+  }
+
+  const baseBranch = task.baseBranch || detectCurrentBranch(repo);
+  if (!baseBranch) {
+    throw new Error(`Unable to determine base branch for ${repo}`);
+  }
+
+  const slug = slugify(task.name, task.index);
+  const newBranch = task.newBranch || `magicwork/${context.date}/${String(task.index).padStart(2, '0')}-${slug}`;
+  const worktreeDirName = `${String(task.index).padStart(2, '0')}-${slug}`;
+  const worktreePath = path.join(context.dayDir, worktreeDirName);
+
+  return {
+    ...task,
+    repo,
+    slug,
+    baseBranch,
+    newBranch,
+    worktreePath,
+  };
+}
+
+function resolveCleanTargets(tasks, rawTargets) {
+  if (!rawTargets.length) {
+    fail('Provide one or more task indexes, worktree directory names, or branch names, or use --all');
+  }
+
+  const byIndex = new Map(tasks.map((task) => [String(task.index), task]));
+  const byDirName = new Map(tasks.map((task) => [path.basename(task.worktreePath), task]));
+  const byBranch = new Map(tasks.map((task) => [task.newBranch, task]));
+  const selected = [];
+  const seen = new Set();
+
+  for (const rawTarget of rawTargets) {
+    const key = String(rawTarget).trim();
+    const task = byIndex.get(key) || byDirName.get(key) || byBranch.get(key);
+    if (!task) {
+      throw new Error(`Unknown clean target: ${rawTarget}`);
+    }
+    if (seen.has(task.worktreePath)) {
+      continue;
+    }
+    seen.add(task.worktreePath);
+    selected.push(task);
+  }
+
+  return selected;
+}
+
+function taskRecordPath(rootDir, task) {
+  return path.join(rootDir, RECORDS_DIR, `${slugify(task.newBranch || task.name, task.index)}.md`);
+}
+
+function generateTaskReport(task) {
+  const tempOutputPath = path.join('/tmp', `magicwork-report-${Date.now()}-${process.pid}.md`);
+  const prompt = [
+    'Review the current repository state and write a concise task progress report in Markdown.',
+    'Use exactly these sections and nothing else:',
+    '### Summary',
+    '- bullet points only',
+    '### Files',
+    '- bullet points only, use file paths',
+    '### Next',
+    '- bullet points only',
+    'Focus on the current worktree status, recent code changes, validation status, blockers, and immediate next steps.',
+  ].join('\n');
+
+  const result = spawnSync('codex', [
+    'exec',
+    '--dangerously-bypass-approvals-and-sandbox',
+    '-C',
+    task.worktreePath,
+    '--output-last-message',
+    tempOutputPath,
+    prompt,
+  ], {
+    encoding: 'utf8',
+  });
+
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `Failed to generate report for ${task.name}`);
+  }
+
+  if (!fs.existsSync(tempOutputPath)) {
+    throw new Error(`Report output was not written for ${task.name}`);
+  }
+
+  const markdown = fs.readFileSync(tempOutputPath, 'utf8').trim();
+  fs.unlinkSync(tempOutputPath);
+
+  if (!markdown) {
+    throw new Error(`Empty report output for ${task.name}`);
+  }
+
+  return markdown;
+}
+
+function appendTaskRecord(recordPath, task, reportMarkdown) {
+  const lines = [];
+
+  if (!fs.existsSync(recordPath)) {
+    lines.push(`# ${task.name}`);
+    lines.push('');
+    lines.push(`- Branch: ${task.newBranch}`);
+    lines.push(`- Repo: ${task.repo}`);
+    lines.push('');
+  }
+
+  lines.push(`## ${new Date().toISOString()}`);
+  lines.push(`- Worktree: ${task.worktreePath}`);
+  lines.push('');
+  lines.push(reportMarkdown.trim());
+  lines.push('');
+
+  fs.appendFileSync(recordPath, `${lines.join('\n')}\n`, 'utf8');
+}
+
+function extractSection(markdown, heading) {
+  const pattern = new RegExp(`${escapeRegExp(heading)}\\n([\\s\\S]*?)(?:\\n### |$)`);
+  const match = markdown.match(pattern);
+  return match ? match[1].trim() : '';
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function ensureWorktree(task) {
+  if (isGitRepo(task.worktreePath)) {
+    return false;
+  }
+
+  if (fs.existsSync(task.worktreePath) && fs.readdirSync(task.worktreePath).length > 0) {
+    throw new Error(`Worktree path exists and is not empty: ${task.worktreePath}`);
+  }
+
+  ensureDir(task.worktreePath);
+
+  const branchAlreadyExists = branchExists(task.repo, task.newBranch);
+
+  const args = ['worktree', 'add'];
+  if (branchAlreadyExists) {
+    args.push(task.worktreePath, task.newBranch);
+  } else {
+    args.push('-b', task.newBranch, task.worktreePath, task.baseBranch);
+  }
+
+  const result = runGit(task.repo, args, { allowFailure: true });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `Failed to create worktree for ${task.name}`);
+  }
+
+  return true;
+}
+
+function isNocoBaseRepo(targetPath) {
+  const packageJsonPath = path.join(targetPath, 'package.json');
+  if (!fs.existsSync(packageJsonPath)) {
+    return false;
+  }
+
+  try {
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    return packageJson.name === 'nocobase';
+  } catch (error) {
+    return false;
+  }
+}
+
+function initializeNocoBaseWorktree(task) {
+  const toolchain = resolvePreferredToolchain();
+  console.log(`[bootstrap] toolchain node=${toolchain.node}`);
+  console.log(`[bootstrap] toolchain yarn=${toolchain.yarn}`);
+  console.log('[bootstrap] run yarn install');
+  runCommand(toolchain.yarn, ['install'], task.worktreePath, `yarn install failed for ${task.name}`, {
+    env: toolchain.env,
+  });
+  console.log('[bootstrap] yarn install done');
+
+  const mainDbName = task.runtimeConfig.mainDbName;
+  const testDbName = task.runtimeConfig.testDbName;
+  const appPort = task.runtimeConfig.appPort;
+  const testAppPort = task.runtimeConfig.testAppPort;
+  const inspectPort = task.runtimeConfig.inspectPort;
+  console.log(`[bootstrap] app db=${mainDbName} test db=${testDbName}`);
+  console.log(`[bootstrap] app port=${appPort} test port=${testAppPort} inspect=${inspectPort}`);
+
+  console.log('[bootstrap] reset .env from examples');
+  resetEnvFileFromExample(task.worktreePath, '.env', '.env.example');
+  resetEnvFileFromExample(task.worktreePath, '.env.test', '.env.test.example');
+
+  console.log('[bootstrap] patch .env');
+  updateEnvFile(path.join(task.worktreePath, '.env'), {
+    APP_PORT: String(appPort),
+    NODE_ARGS: `"--inspect-brk=${inspectPort}"`,
+    DB_DIALECT: 'postgres',
+    DB_HOST: 'localhost',
+    DB_PORT: '5432',
+    DB_DATABASE: mainDbName,
+    DB_USER: 'postgres',
+    DB_PASSWORD: 'postgres',
+  });
+
+  console.log('[bootstrap] patch .env.test');
+  updateEnvFile(path.join(task.worktreePath, '.env.test'), {
+    APP_PORT: String(testAppPort),
+    DB_DIALECT: 'postgres',
+    DB_HOST: 'localhost',
+    DB_PORT: '5432',
+    DB_DATABASE: testDbName,
+    DB_USER: 'postgres',
+    DB_PASSWORD: 'postgres',
+  });
+
+  console.log(`[bootstrap] ensure database ${mainDbName}`);
+  ensurePostgresDatabase(mainDbName);
+  console.log(`[bootstrap] ensure database ${testDbName}`);
+  ensurePostgresDatabase(testDbName);
+
+  console.log('[bootstrap] run yarn nocobase install');
+  runCommand(toolchain.yarn, ['nocobase', 'install'], task.worktreePath, `yarn nocobase install failed for ${task.name}`, {
+    env: toolchain.env,
+  });
+  console.log('[bootstrap] done');
+}
+
+function resetEnvFileFromExample(worktreePath, targetName, exampleName) {
+  const targetPath = path.join(worktreePath, targetName);
+  const examplePath = path.join(worktreePath, exampleName);
+
+  if (!fs.existsSync(examplePath)) {
+    throw new Error(`Env example file not found: ${examplePath}`);
+  }
+
+  fs.copyFileSync(examplePath, targetPath);
+}
+
+function updateEnvFile(filePath, updates) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Env file not found: ${filePath}`);
+  }
+
+  let content = fs.readFileSync(filePath, 'utf8');
+  for (const [key, value] of Object.entries(updates)) {
+    const pattern = new RegExp(`^${escapeRegExp(key)}=.*$`, 'm');
+    const nextLine = `${key}=${value}`;
+    if (pattern.test(content)) {
+      content = content.replace(pattern, nextLine);
+    } else {
+      if (!content.endsWith('\n')) {
+        content += '\n';
+      }
+      content += `${nextLine}\n`;
+    }
+  }
+  fs.writeFileSync(filePath, content, 'utf8');
+}
+
+function ensurePostgresDatabase(databaseName) {
+  const psqlPath = resolveExecutable('psql');
+  if (!psqlPath) {
+    throw new Error('psql not found in PATH');
+  }
+
+  const env = {
+    ...process.env,
+    PGPASSWORD: 'postgres',
+  };
+
+  const existsResult = spawnSync(psqlPath, [
+    '-h', 'localhost',
+    '-p', '5432',
+    '-U', 'postgres',
+    '-d', 'postgres',
+    '-tAc',
+    `SELECT 1 FROM pg_database WHERE datname = '${databaseName.replace(/'/g, "''")}';`,
+  ], {
+    encoding: 'utf8',
+    env,
+  });
+
+  if (existsResult.status !== 0) {
+    throw new Error(existsResult.stderr.trim() || `Failed to check database ${databaseName}`);
+  }
+
+  if (existsResult.stdout.trim() === '1') {
+    return;
+  }
+
+  const createDbPath = resolveExecutable('createdb');
+  if (!createDbPath) {
+    throw new Error('createdb not found in PATH');
+  }
+
+  const createResult = spawnSync(createDbPath, [
+    '-h', 'localhost',
+    '-p', '5432',
+    '-U', 'postgres',
+    databaseName,
+  ], {
+    encoding: 'utf8',
+    env,
+  });
+
+  if (createResult.status !== 0) {
+    throw new Error(createResult.stderr.trim() || `Failed to create database ${databaseName}`);
+  }
+}
+
+function dropPostgresDatabase(databaseName) {
+  const psqlPath = resolveExecutable('psql');
+  if (!psqlPath) {
+    throw new Error('psql not found in PATH');
+  }
+
+  const env = {
+    ...process.env,
+    PGPASSWORD: 'postgres',
+  };
+
+  const terminateResult = spawnSync(psqlPath, [
+    '-h', 'localhost',
+    '-p', '5432',
+    '-U', 'postgres',
+    '-d', 'postgres',
+    '-tAc',
+    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${databaseName.replace(/'/g, "''")}' AND pid <> pg_backend_pid();`,
+  ], {
+    encoding: 'utf8',
+    env,
+  });
+
+  if (terminateResult.status !== 0) {
+    throw new Error(terminateResult.stderr.trim() || `Failed to terminate connections for ${databaseName}`);
+  }
+
+  const dropResult = spawnSync(psqlPath, [
+    '-h', 'localhost',
+    '-p', '5432',
+    '-U', 'postgres',
+    '-d', 'postgres',
+    '-tAc',
+    `DROP DATABASE IF EXISTS "${databaseName.replace(/"/g, '""')}";`,
+  ], {
+    encoding: 'utf8',
+    env,
+  });
+
+  if (dropResult.status !== 0) {
+    throw new Error(dropResult.stderr.trim() || `Failed to drop database ${databaseName}`);
+  }
+}
+
+function runCommand(command, args, cwd, errorMessage, options = {}) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: 'inherit',
+    env: options.env || process.env,
+  });
+
+  if (result.status !== 0) {
+    throw new Error(errorMessage);
+  }
+}
+
+function formatDatabaseName(input) {
+  const normalized = String(input)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 50);
+
+  return `mw_${normalized || 'task'}`;
+}
+
+function resolvePreferredToolchain() {
+  const nodePath = path.join(PREFERRED_NODE_BIN_DIR, 'node');
+  const yarnPath = path.join(PREFERRED_NODE_BIN_DIR, 'yarn');
+
+  if (fs.existsSync(nodePath) && fs.existsSync(yarnPath)) {
+    return {
+      node: nodePath,
+      yarn: yarnPath,
+      env: {
+        ...process.env,
+        PATH: `${PREFERRED_NODE_BIN_DIR}${path.delimiter}${process.env.PATH || ''}`,
+      },
+    };
+  }
+
+  return {
+    node: 'node',
+    yarn: 'yarn',
+    env: process.env,
+  };
+}
+
+function findAvailablePortSync(startPort, reservedPorts = new Set()) {
+  let port = startPort;
+  while (port < 65535) {
+    if (!reservedPorts.has(port) && isPortAvailableSync(port)) {
+      return port;
+    }
+    port += 1;
+  }
+
+  throw new Error(`No available port found from ${startPort}`);
+}
+
+function isPortAvailableSync(port) {
+  const result = spawnSync('lsof', [
+    '-nP',
+    `-iTCP:${port}`,
+    '-sTCP:LISTEN',
+  ], {
+    encoding: 'utf8',
+  });
+
+  if (result.error && result.error.code === 'ENOENT') {
+    throw new Error('lsof not found in PATH');
+  }
+
+  if (result.status === 1) {
+    return true;
+  }
+
+  if (result.status === 0) {
+    return false;
+  }
+
+  throw new Error(result.stderr.trim() || `Failed to check port ${port}`);
+}
+
+function collectReservedPorts(searchRoots) {
+  const ports = new Set();
+  const seen = new Set();
+
+  for (const root of searchRoots) {
+    scanNocoBaseDirs(root, root === process.cwd() ? 2 : 0, ports, seen);
+  }
+
+  return ports;
+}
+
+function scanNocoBaseDirs(dirPath, depth, ports, seen) {
+  const resolved = path.resolve(dirPath);
+  if (seen.has(resolved) || !fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    return;
+  }
+  seen.add(resolved);
+
+  if (isNocoBaseRepo(resolved)) {
+    collectPortsFromEnvFile(path.join(resolved, '.env'), ports);
+    collectPortsFromEnvFile(path.join(resolved, '.env.test'), ports);
+    return;
+  }
+
+  if (depth <= 0) {
+    return;
+  }
+
+  for (const entry of fs.readdirSync(resolved, { withFileTypes: true })) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'records' || entry.name === 'bin') {
+      continue;
+    }
+    scanNocoBaseDirs(path.join(resolved, entry.name), depth - 1, ports, seen);
+  }
+}
+
+function collectPortsFromEnvFile(filePath, ports) {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  const appPortMatch = content.match(/^APP_PORT=(\d+)$/m);
+  if (appPortMatch) {
+    ports.add(Number(appPortMatch[1]));
+  }
+
+  const nodeArgsMatch = content.match(/^NODE_ARGS="?--inspect-brk(?:=|:)?(\d+)"?$/m);
+  if (nodeArgsMatch) {
+    ports.add(Number(nodeArgsMatch[1]));
+  }
+}
+
+function removeWorktreeAndBranch(task, logger = () => {}) {
+  if (fs.existsSync(task.worktreePath) && isGitRepo(task.worktreePath)) {
+    logger(`clean: git worktree remove --force ${task.worktreePath}`);
+    const removeResult = runGit(task.repo, ['worktree', 'remove', '--force', task.worktreePath], {
+      allowFailure: true,
+    });
+    if (removeResult.status !== 0) {
+      throw new Error(removeResult.stderr.trim() || `Failed to remove worktree for ${task.name}`);
+    }
+    logger(`clean: removed worktree ${task.worktreePath}`);
+  } else {
+    logger(`clean: skip worktree remove, path not an active git worktree: ${task.worktreePath}`);
+  }
+
+  if (branchExists(task.repo, task.newBranch)) {
+    logger(`clean: git branch -D ${task.newBranch}`);
+    const branchResult = runGit(task.repo, ['branch', '-D', task.newBranch], {
+      allowFailure: true,
+    });
+    if (branchResult.status !== 0) {
+      throw new Error(branchResult.stderr.trim() || `Failed to delete branch for ${task.name}`);
+    }
+    logger(`clean: removed branch ${task.newBranch}`);
+  } else {
+    logger(`clean: skip branch delete, branch not found: ${task.newBranch}`);
+  }
+}
+
+function logCleanStep(message) {
+  console.log(message);
+}
+
+function findWorktreePathByBranch(repo, branchName) {
+  const result = runGit(repo, ['worktree', 'list', '--porcelain'], { allowFailure: true });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `Failed to list worktrees for ${repo}`);
+  }
+
+  const lines = result.stdout.split('\n');
+  let currentWorktree = '';
+  let currentBranch = '';
+
+  for (const line of [...lines, '']) {
+    if (!line.trim()) {
+      if (currentWorktree && currentBranch === `refs/heads/${branchName}`) {
+        return currentWorktree;
+      }
+      currentWorktree = '';
+      currentBranch = '';
+      continue;
+    }
+
+    if (line.startsWith('worktree ')) {
+      currentWorktree = line.slice('worktree '.length).trim();
+      continue;
+    }
+
+    if (line.startsWith('branch ')) {
+      currentBranch = line.slice('branch '.length).trim();
+    }
+  }
+
+  return '';
+}
+
+function launchKittyTab(task, socketAddress, { shouldBootstrapNocoBase = false, sendPrompt = true } = {}) {
+  const windowTitle = task.name;
+  const codexTabTitle = `${task.name} / codex`;
+  const viTabTitle = `${task.name} / vi`;
+  const codeTabTitle = `${task.name} / code`;
+  const codexCommand = [
+    'codex',
+    '--dangerously-bypass-approvals-and-sandbox',
+    '-c',
+    'shell_environment_policy.inherit=all',
+    '-c',
+    `notify=["python3","${CODEX_NOTIFY_SCRIPT}"]`,
+    '-C',
+    task.worktreePath,
+  ];
+  if (sendPrompt) {
+    codexCommand.push(task.prompt);
+  }
+  const codexWindowId = launchKittyWindow(
+    socketAddress,
+    {
+      type: 'os-window',
+      title: codexTabTitle,
+      tabTitle: codexTabTitle,
+      cwd: task.worktreePath,
+      hold: true,
+      keepFocus: true,
+      osWindowTitle: windowTitle,
+      watcher: CODEX_WATCHER_SCRIPT,
+      env: {
+        MW_ROLE: 'codex',
+        MW_CODEX_CWD: task.worktreePath,
+        MW_TAB_TITLE: codexTabTitle,
+        MW_SOCKET: socketAddress,
+      },
+    },
+    codexCommand,
+    task.name,
+  );
+
+  const codexWindowIdText = String(codexWindowId);
+  launchKittyWindow(
+    socketAddress,
+    {
+      type: 'tab',
+      title: 'vi',
+      tabTitle: viTabTitle,
+      cwd: task.worktreePath,
+      hold: true,
+      match: `window_id:${codexWindowIdText}`,
+      keepFocus: true,
+    },
+    [defaultShell(), '-lic', buildEditorLaunchCommand(task.worktreePath)],
+    task.name,
+  );
+
+  launchKittyWindow(
+    socketAddress,
+    {
+      type: 'tab',
+      title: 'code',
+      tabTitle: codeTabTitle,
+      cwd: task.worktreePath,
+      hold: true,
+      match: `window_id:${codexWindowIdText}`,
+      keepFocus: true,
+    },
+    shouldBootstrapNocoBase
+      ? [defaultShell(), '-lc', buildNocoBaseBootstrapCommand(task)]
+      : [defaultShell(), '-l'],
+    task.name,
+  );
+}
+
+function launchKittyWindow(socketAddress, options, command, taskName) {
+  const args = ['@', '--to', socketAddress, 'launch'];
+  if (options.match) {
+    args.push('--match', options.match);
+  }
+  args.push(`--type=${options.type}`);
+  if (options.keepFocus) {
+    args.push('--dont-take-focus');
+  }
+  args.push('--env', `PATH=${buildKittyPathEnv()}`);
+  args.push('--env', `SHELL=${defaultShell()}`);
+  for (const [key, value] of Object.entries(options.env || {})) {
+    args.push('--env', `${key}=${value}`);
+  }
+  args.push('--title', options.title);
+  args.push('--tab-title', options.tabTitle);
+  args.push('--cwd', options.cwd);
+  if (options.hold) {
+    args.push('--hold');
+  }
+  if (options.osWindowTitle) {
+    args.push('--os-window-title', options.osWindowTitle);
+  }
+  if (options.watcher) {
+    args.push('--watcher', options.watcher);
+  }
+  args.push(...command);
+
+  const result = spawnSync('kitty', args, { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `Failed to launch kitty window for ${taskName}`);
+  }
+
+  return result.stdout.trim();
+}
+
+function resolveKittySocket(explicitSocket) {
+  if (explicitSocket) {
+    return explicitSocket;
+  }
+
+  if (process.env.KITTY_LISTEN_ON) {
+    return process.env.KITTY_LISTEN_ON;
+  }
+
+  return DEFAULT_SOCKET;
+}
+
+function ensureKittyServer(socketAddress) {
+  if (kittyServerReady(socketAddress)) {
+    return;
+  }
+
+  spawn('kitty', [
+    '--single-instance',
+    '--instance-group',
+    'magicwork',
+    '--listen-on',
+    socketAddress,
+    '-o',
+    'allow_remote_control=yes',
+  ], {
+    detached: true,
+    stdio: 'ignore',
+  }).unref();
+
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    sleep(250);
+    if (kittyServerReady(socketAddress)) {
+      return;
+    }
+  }
+
+  throw new Error(`Kitty remote control is not ready on ${socketAddress}`);
+}
+
+function kittyServerReady(socketAddress) {
+  const result = spawnSync('kitty', ['@', '--to', socketAddress, 'ls'], {
+    encoding: 'utf8',
+  });
+  return result.status === 0;
+}
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function defaultShell() {
+  return process.env.SHELL || '/bin/zsh';
+}
+
+function buildKittyPathEnv() {
+  const segments = [];
+  const seen = new Set();
+
+  for (const value of [
+    process.env.PATH || '',
+    PREFERRED_NODE_BIN_DIR,
+    '/opt/homebrew/bin',
+    '/opt/homebrew/opt/libpq/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ]) {
+    for (const entry of String(value).split(path.delimiter)) {
+      if (!entry || seen.has(entry)) {
+        continue;
+      }
+      seen.add(entry);
+      segments.push(entry);
+    }
+  }
+
+  return segments.join(path.delimiter);
+}
+
+function buildEditorLaunchCommand(targetDir) {
+  const shellDir = shellEscape(targetDir);
+  const nvimPath = resolveExecutable('nvim');
+  if (nvimPath) {
+    return `cd ${shellDir} && exec ${shellEscape(nvimPath)}`;
+  }
+
+  return `cd ${shellDir} && exec vi`;
+}
+
+function buildNocoBaseBootstrapCommand(task) {
+  const shellPath = shellEscape(defaultShell());
+  const runtimeConfig = task.runtimeConfig || {};
+  const cmd = [
+    shellEscape(process.execPath),
+    shellEscape(__filename),
+    'bootstrap-nocobase',
+    '--worktree',
+    shellEscape(task.worktreePath),
+    '--repo',
+    shellEscape(task.repo),
+    '--branch',
+    shellEscape(task.newBranch),
+    '--slug',
+    shellEscape(task.slug),
+    '--name',
+    shellEscape(task.name),
+    '--db-name',
+    shellEscape(runtimeConfig.mainDbName || ''),
+    '--test-db-name',
+    shellEscape(runtimeConfig.testDbName || ''),
+    '--app-port',
+    shellEscape(String(runtimeConfig.appPort || '')),
+    '--test-app-port',
+    shellEscape(String(runtimeConfig.testAppPort || '')),
+    '--inspect-port',
+    shellEscape(String(runtimeConfig.inspectPort || '')),
+  ].join(' ');
+
+  return `${cmd}; exec ${shellPath} -l`;
+}
+
+function planNocoBaseRuntimeConfigs(tasks, rootDir) {
+  const reservedPorts = collectReservedPorts([rootDir, ...new Set(tasks.map((task) => task.repo))]);
+  const configs = new Map();
+
+  for (const task of tasks) {
+    if (!isNocoBaseRepo(task.repo)) {
+      continue;
+    }
+
+    const mainDbName = formatDatabaseName(task.newBranch || task.slug);
+    const testDbName = `${mainDbName}_test`.slice(0, 63);
+    const appPort = findAvailablePortSync(13001, reservedPorts);
+    reservedPorts.add(appPort);
+    const testAppPort = findAvailablePortSync(13001, reservedPorts);
+    reservedPorts.add(testAppPort);
+    const inspectPort = findAvailablePortSync(9230, reservedPorts);
+    reservedPorts.add(inspectPort);
+
+    configs.set(task.newBranch, {
+      mainDbName,
+      testDbName,
+      appPort,
+      testAppPort,
+      inspectPort,
+    });
+  }
+
+  return configs;
+}
+
+function resolveExecutable(binary) {
+  const result = spawnSync('which', [binary], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return '';
+  }
+  return result.stdout.trim();
+}
+
+function shellEscape(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function detectCurrentBranch(repo) {
+  const result = runGit(repo, ['branch', '--show-current'], { allowFailure: true });
+  if (result.status !== 0) {
+    return '';
+  }
+  return result.stdout.trim();
+}
+
+function isGitRepo(targetPath) {
+  const result = spawnSync('git', ['-C', targetPath, 'rev-parse', '--is-inside-work-tree'], {
+    encoding: 'utf8',
+  });
+  return result.status === 0 && result.stdout.trim() === 'true';
+}
+
+function runGit(repo, args, { allowFailure = false } = {}) {
+  const result = spawnSync('git', ['-C', repo, ...args], {
+    encoding: 'utf8',
+  });
+
+  if (!allowFailure && result.status !== 0) {
+    throw new Error(result.stderr.trim() || `git ${args.join(' ')} failed in ${repo}`);
+  }
+
+  return result;
+}
+
+function branchExists(repo, branchName) {
+  return runGit(repo, ['show-ref', '--verify', '--quiet', `refs/heads/${branchName}`], {
+    allowFailure: true,
+  }).status === 0;
+}
+
+function slugify(input, index) {
+  const slug = String(input)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+
+  return slug || `task-${index}`;
+}
+
+function ensureDir(targetPath) {
+  fs.mkdirSync(targetPath, { recursive: true });
+}
+
+function printHelp() {
+  console.log([
+    'magicwork',
+    '',
+    'Commands:',
+    '  init [--date YYYY-MM-DD]     Create a daily Markdown task template',
+    '  run [file] [--date ...]      Create worktrees and launch Codex in kitty tabs',
+    '  restore [targets...]         Reopen active task windows without init or prompt',
+    '  clean [file] [targets...]    Remove worktrees and their branches',
+    '  report [file] [targets...]   Summarize task progress into records/',
+    '',
+    'Examples:',
+    '  ./bin/magicwork init',
+    '  ./bin/magicwork init --no-carry-active',
+    '  ./bin/magicwork run',
+    '  ./bin/magicwork run --rerun-launched',
+    '  ./bin/magicwork restore',
+    '  ./bin/magicwork restore 1 3',
+    '  ./bin/magicwork restore task-3512',
+    '  ./bin/magicwork run --dry-run',
+    '  ./bin/magicwork clean 1 3',
+    '  ./bin/magicwork clean 01-task-1',
+    '  ./bin/magicwork clean magicwork/2026-04-17/01-task-1',
+    '  ./bin/magicwork clean --all',
+    '  ./bin/magicwork report 1',
+    '  ./bin/magicwork report --all',
+    '  ./bin/magicwork run 2026-04-17/tasks.md',
+  ].join('\n'));
+}
+
+function fail(message) {
+  console.error(`Error: ${message}`);
+  process.exit(1);
+}

@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Runtime state
+.magicwork-active.json
+records/
+sessions/
+summaries/
+
+# Generated daily workspaces and notes
+20??-??-??/
+
+# Optional local scratch
+.tmp/
+.cache/
