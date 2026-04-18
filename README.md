@@ -1,139 +1,434 @@
 # MagicWork
 
-每天使用 Markdown 填 5 个任务，然后批量创建 worktree、打开 kitty tab，并在每个 tab 里启动 `codex` 发送初始提示词。
+[中文说明](./README.zh-CN.md)
 
-## 用法
+MagicWork is a Markdown-first AI development workflow for planning, launching, resuming, and cleaning up parallel coding-agent tasks with isolated git worktrees, task cards, resumable agent sessions, and terminal automation.
 
-生成当天模板：
+The current reference implementation targets `Codex + kitty`, but the core idea is broader: treat AI-assisted development as a daily operating system. Write tasks once, launch isolated workspaces fast, resume the right agent session later, and use terminal-level signals such as notifications and quick switching to move attention across parallel work.
 
-```bash
-./bin/magicwork init
+## Prompt To Recreate Or Adapt This Project
+
+Use the prompt below if you want an AI to build a similar system for your own stack.
+
+````text
+Build a local AI development workflow tool called <PROJECT_NAME>.
+
+I do not want just another task runner. I want a daily operating system for AI-assisted software development.
+
+Product goal:
+- Every day starts from Markdown task cards grouped by date.
+- Each task card represents one concrete stream of work for a coding agent.
+- Each stream gets its own isolated git worktree, working branch, terminal workspace, and resumable agent session.
+- I want to move across multiple parallel AI tasks the way I move across teammates: resume context, notice who is waiting on me, and jump back into the exact workspace that needs attention.
+- The system should leave useful work traces automatically instead of depending on manual reporting.
+- It should generate per-task summaries automatically so progress can be reviewed later.
+- It should support project-specific setup and cleanup through hooks, so the core stays generic while repositories can still bootstrap themselves.
+
+Core design:
+- Separate these paths clearly:
+  - osRoot: config and runtime state only
+  - recordsDir: task cards, daily index, summaries
+  - codeDir: generated worktrees only
+- recordsDir and codeDir must be explicitly configured.
+- Use one Markdown card per task as the source of truth.
+- Generate an index.md for each day from those task cards.
+- Carry unfinished active tasks into the next day by default.
+
+Development constraints:
+- Task cards are stable human-authored configuration.
+- Runtime state and task cards must be strictly separated.
+- Agent session resume is a core capability, not an optional extra.
+- Notifications and window switching are part of the workflow, not afterthoughts.
+- Project-specific initialization logic must not be hardcoded in the core; use hooks or external scripts.
+
+Required behavior:
+- `init`
+  - create the date folder if missing
+  - create 5 new task cards every time it runs
+  - if the day already exists, append instead of overwriting
+- `sync`
+  - rebuild index.md from task cards
+- `run`
+  - create worktrees and launch one terminal workspace per task
+  - by default only launch tasks that have not been launched before
+- `restore`
+  - reopen active task workspaces without reinitializing the environment and without resending the initial prompt
+  - if a saved session id exists, resume the previous coding-agent session
+- `clean`
+  - remove one or more worktrees and branches
+  - optionally generate a summary before cleanup
+  - support `--no-summary`
+- `report`
+  - generate or append a summary without cleanup
+- `config`
+  - initialize and inspect configuration
+
+Execution model:
+- One task = one isolated worktree + one terminal workspace.
+- The terminal layout can vary, but a strong reference pattern is:
+  - one agent tab
+  - one editor tab
+  - one code/setup tab
+- Focus should land on the agent tab after launch.
+- Restore should reopen the workspace without replaying the initial prompt.
+
+Session, notification, and switching model:
+- If the coding agent supports resumable sessions, store the session id in runtime state and use it on restore.
+- If the agent stores conversation logs in structured session files such as jsonl, keep only the session id in runtime state and derive summaries from the original conversation source when needed.
+- The terminal layer should expose attention signals when the agent is waiting for user input.
+- The terminal layer should use a shared remote-control socket or equivalent so all task windows can be discovered and controlled consistently.
+- Fast switching between task windows should be easy, for example through a helper like `kls`.
+
+For a `Codex + kitty` implementation, use this concrete reference:
+- Run all task windows against one shared kitty socket such as `unix:/tmp/kitty.sock`.
+- Detect Codex waiting-for-input events and reflect them in the terminal UI.
+- When a task enters a waiting state:
+  - update the tab title to something like `<task> [waiting]`
+  - emit a kitty notification so I notice it immediately
+  - keep enough metadata to jump back to the exact task window fast
+- Implement a shell helper like `kls` on top of `kitty @ ls` plus `fzf` so I can jump to any task window quickly.
+
+Useful references:
+- Codex notifications: https://developers.openai.com/codex/config-advanced#notifications
+- Kitty notify kitten: https://sw.kovidgoyal.net/kitty/kittens/notify/
+- Kitty remote control: https://sw.kovidgoyal.net/kitty/remote-control/
+
+For hook support, use this concrete reference from the current repository:
+- Configure lifecycle scripts outside task cards and outside the core logic, then inject them through config keys such as `onCodeTabOpen` and `onClean`.
+- Run the startup hook inside the task’s code/setup tab so repository-specific initialization happens inside the task workspace instead of blocking the current shell.
+- Run the cleanup hook before worktree and branch removal so repositories can release local resources such as databases or caches.
+
+For automatic summaries and work traces, use this concrete reference from the current repository:
+- Generate summaries per task, not as one summary for the whole day.
+- Tie summary generation to cleanup and explicit reporting: `clean` can auto-generate a summary before deletion, and `report` can generate or append a summary without cleanup.
+- Keep runtime state small and use the saved session id to go back to the original agent session source when generating summaries.
+- Avoid scraping raw terminal output. Derive summaries from the real agent conversation history so work traces stay reliable.
+
+Extensibility:
+- Do not hardcode project-specific repository logic into the core.
+- Provide lifecycle hooks or external scripts for setup and cleanup.
+- Typical hook responsibilities include dependency installation, env bootstrapping, local database creation, service startup, and cleanup.
+
+Implementation preferences:
+- Use a single CLI entrypoint.
+- Prefer simple local files over databases for runtime state.
+- Keep the code pragmatic and easy to inspect.
+- Write the README around product capabilities and workflow concepts, not just command syntax.
+````
+
+## What It Does
+
+- Creates daily task cards under a date folder.
+- Maps each task to its own git branch and git worktree.
+- Launches one terminal workspace per task.
+- Tracks active tasks and saved session ids outside the task cards.
+- Rebuilds a daily `index.md` from task cards.
+- Restores active workspaces later without re-sending the initial prompt.
+- Generates task summaries before cleanup, unless you explicitly skip them.
+- Supports project-specific bootstrap and cleanup through lifecycle hooks.
+
+## Architecture
+
+MagicWork separates three kinds of paths:
+
+- `osRoot`
+  - config and runtime state only
+  - default: `~/.config/magicwork`
+- `recordsDir`
+  - date folders, task cards, indexes, summaries
+  - must be configured explicitly
+- `codeDir`
+  - generated git worktrees only
+  - must be configured explicitly
+
+Optional:
+
+- `defaultRepo`
+  - default source repository for new task cards
+- `hooks`
+  - external lifecycle scripts for project-specific bootstrap and cleanup
+
+## Daily Records Layout
+
+Each day under `recordsDir` looks like this:
+
+```text
+YYYY-MM-DD/
+  index.md
+  tasks/
+    01-task-1.md
+    02-task-2.md
+    ...
+  summaries/
+    01-task-1.md
+    02-task-2.md
+    ...
 ```
 
-不带 active 任务，生成空白模板：
+Meaning:
+
+- `tasks/*.md`
+  - source of truth
+  - edited by you
+- `index.md`
+  - generated overview
+  - includes status and session id when available
+- `summaries/*.md`
+  - generated task summaries
+  - appended by `report` or `clean`
+
+## Installation
+
+MagicWork is currently a local CLI script. A simple way to install it is to symlink `bin/magicwork` into a directory already on your `PATH`.
+
+Example:
 
 ```bash
-./bin/magicwork init --no-carry-active
+chmod +x bin/magicwork
+ln -sf "$(pwd)/bin/magicwork" /usr/local/bin/mw
 ```
 
-会在当前目录下创建 `YYYY-MM-DD/`，并生成：
-
-- 第一次：`tasks.md`
-- 第二次开始：`tasks-02.md`、`tasks-03.md` ...
-
-执行当天任务：
+If you do not want a global command, you can run it directly:
 
 ```bash
-./bin/magicwork run
+./bin/magicwork help
 ```
 
-默认只启动还没启动过的任务。若要显式重开已启动任务：
+Reference implementation requirements:
+
+- `git`
+- `node`
+- `kitty`
+- `python3`
+- `codex`
+
+Suggested global install:
 
 ```bash
-./bin/magicwork run --rerun-launched
+chmod +x bin/magicwork
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/bin/magicwork" ~/.local/bin/mw
 ```
 
-先预览将要执行的结果：
+Make sure `~/.local/bin` is on your `PATH`.
+
+## Kitty Socket And Quick Switching
+
+The current implementation controls kitty through a shared remote-control socket. By default it uses:
+
+```text
+unix:/tmp/kitty.sock
+```
+
+This matters for two reasons:
+
+- MagicWork can create and restore task workspaces reliably.
+- You can build helper commands such as `kls` to quickly jump across any kitty window or tab.
+
+You can either let MagicWork start a kitty instance on that socket automatically, or make all your kitty instances use the same socket yourself.
+
+Example startup:
 
 ```bash
-./bin/magicwork run --dry-run
+kitty --listen-on unix:/tmp/kitty.sock
 ```
 
-也可以指定文件：
+MagicWork also supports overriding the socket:
 
 ```bash
-./bin/magicwork run 2026-04-17/tasks.md
+mw run --socket unix:/tmp/kitty.sock
+mw restore --socket unix:/tmp/kitty.sock
 ```
 
-如果 kitty 重启了，可以按 active 状态恢复所有任务窗口：
+If you want a quick-switch helper in shell, a simple pattern is to wrap `kitty @ ls` on the shared socket and feed the results into `fzf`.
+
+Example `~/.zshrc` function:
 
 ```bash
-./bin/magicwork restore
+kls() {
+  local socket="${KITTY_SOCKET:-unix:/tmp/kitty.sock}"
+  local target
+  target="$(
+    kitty @ --to "$socket" ls | jq -r '
+      .[] as $os
+      | $os.tabs[]
+      | . as $tab
+      | $tab.windows[]
+      | "\(.id)\t\($tab.title // "-")\t\(.title // "-")"
+    ' | fzf
+  )" || return 1
+
+  local window_id
+  window_id="$(printf '%s\n' "$target" | cut -f1)"
+  [ -n "$window_id" ] || return 1
+  kitty @ --to "$socket" focus-window --match "id:$window_id"
+}
 ```
 
-`restore` 只重开窗口和 3 个 tab，不重新初始化环境，也不会再次发送 prompt。
+That example is intentionally generic. You can replace it with your own `kls` implementation.
 
-也可以只恢复单个或多个 active 任务：
+## Configuration
+
+Initialize config:
 
 ```bash
-./bin/magicwork restore 1
-./bin/magicwork restore 1 3
-./bin/magicwork restore task-3512
-./bin/magicwork restore 01-task-1
+mw config init \
+  --os-root ~/.config/magicwork \
+  --records-dir /path/to/magicwork-records \
+  --code-dir /path/to/magicwork-code \
+  --default-repo /path/to/default-repo \
+  --hook-on-code-tab-open /path/to/hook.sh \
+  --hook-on-clean /path/to/hook.sh
 ```
 
-清理单个或多个任务的 worktree 和分支：
+Show current config:
 
 ```bash
-./bin/magicwork clean 1 3
-./bin/magicwork clean 01-task-1
-./bin/magicwork clean magicwork/2026-04-17/01-task-1
+mw config show
 ```
 
-清理当天全部任务的 worktree 和分支：
+## Commands
+
+Create today’s task cards:
 
 ```bash
-./bin/magicwork clean --all
+mw init
 ```
 
-为单个或多个任务生成进展总结并写入 `records/`：
+Running `mw init` again on the same day appends 5 more task cards.
+
+Rebuild the daily index:
 
 ```bash
-./bin/magicwork report 1
-./bin/magicwork report 1 3
-./bin/magicwork report --all
+mw sync --date 2026-04-18
 ```
 
-## 模板字段
+Launch today’s tasks:
 
-- `Enabled`: 改成 `yes` 才会执行。
-- `Workdir`: 源仓库目录。默认 `/Users/xile/code/nocobase/nocobase`。
-- `BaseBranch`: worktree 的起点分支。留空时取 `Workdir` 当前分支。
-- `NewBranch`: 新分支名。留空时自动生成 `magicwork/<date>/<task>`。
-- `InitEnv`: 是否自动初始化环境。默认 `yes`。
-- `prompt`: 启动 `codex` 时发送的初始提示词。
-- 默认会把尚未 `clean` 的 active 任务自动带到新一天模板中。
-- 如果新建的是 NocoBase worktree，会自动做初始化。
-- `report` 会按任务把总结追加到 `records/*.md`。
-- `run` 默认只启动未启动过的任务；已启动任务会跳过，除非使用 `--rerun-launched`。
-- `restore` 默认会按 `.magicwork-active.json` 重开全部 active 任务，也支持按索引、目录名、分支名单独恢复；不重复初始化，也不重复发送 prompt。
+```bash
+mw run
+```
 
-模板示例：
+By default, `mw run` launches only tasks that have not been launched before. To relaunch already active tasks, use:
+
+```bash
+mw run --rerun-launched
+```
+
+You can also point to a specific index or task card:
+
+```bash
+mw run /path/to/records/2026-04-18/index.md
+mw run /path/to/records/2026-04-18/tasks/01-task-1.md
+```
+
+Restore active task windows:
+
+```bash
+mw restore
+mw restore 1
+mw restore task-1234
+```
+
+Clean worktrees and branches:
+
+```bash
+mw clean 1 3
+mw clean --all
+mw clean 1 3 --no-summary
+```
+
+Generate summaries without cleanup:
+
+```bash
+mw report 1
+mw report --all
+```
+
+## Task Card Format
+
+Example:
 
 ````md
-## Task 1
-
-- Name: 修复权限按钮
-- Enabled: yes
-- Workdir: /Users/xile/code/nocobase/nocobase
-- BaseBranch: main
-- NewBranch:
+---
+name: "Fix auth button"
+enabled: true
+workdir: "/path/to/repo"
+baseBranch: "main"
+newBranch: ""
+hooks:
+  - onCodeTabOpen
+  - onClean
+---
 
 ```prompt
-修复权限按钮在移动端不显示的问题。
-先阅读相关页面、定位根因、完成修复并自行验证。
+Read the relevant page, locate the root cause, implement the fix, and verify it.
 ```
 ````
 
-## 行为说明
+Notes:
 
-- 每个启用任务都会在当天目录下创建一个 worktree，目录名格式为 `01-task-name`。
-- 如果 `NewBranch` 已存在，则复用该分支创建 worktree。
-- 如果 `NewBranch` 为空，则自动创建新分支。
-- `codex` 通过 `--dangerously-bypass-approvals-and-sandbox` 启动。
-- 每个启用任务会打开一个新的 kitty 窗口，窗口标题使用任务名。
-- 每个窗口固定创建 3 个 tab：`codex`、`vi`、`code`。
-- `--dry-run` 只打印计划，不创建 worktree，也不打开 kitty。
-- `clean` 会同时删除对应的 git worktree 和本地分支。
-- 对于 NocoBase 任务，`clean` 还会删除自动创建的主库和测试库。
-- `run` 成功启动后会把任务登记到 `.magicwork-active.json`。
-- `clean` 成功后会把对应任务从 `.magicwork-active.json` 移除。
-- `restore` 会根据 `.magicwork-active.json` 和当前 git worktree 状态恢复窗口。
-- `report` 会调用 `codex exec` 读取任务 worktree，并把进展总结写入对应任务记录。
-- 新建 NocoBase worktree 时，第三个 `code` tab 会自动执行初始化：直接执行 `yarn install`，随后重写 `.env` 和 `.env.test` 的 Postgres 配置、创建主库和测试库、分配不冲突的 `APP_PORT` / inspect 端口、最后执行 `yarn nocobase install`。
+- front matter is the task configuration source
+- `enabled: true` means the task participates in `run`
+- `prompt` is the initial agent prompt
+- `newBranch` can be left empty for auto-generation
+- `hooks` controls which lifecycle hook events are enabled for that task
+- for example, `hooks: [onClean]` skips the startup hook but keeps cleanup enabled
 
-## 注意
+## Session Tracking And Restore
 
-- `kitty` 和 `codex` 需要已安装并在 PATH 内。
-- `Workdir` 必须是 Git 仓库。
-- 已存在且非空、但不是 Git worktree 的目标目录会直接报错，避免误覆盖。
+MagicWork treats task cards as static configuration and keeps runtime state elsewhere.
+
+- Active task state is stored under `osRoot`
+- `index.md` shows the current `sessionId` when available
+- `restore` resumes the saved session if the current agent supports session resume
+- Summaries are generated from the original session source instead of terminal transcript scraping
+
+In the current reference implementation, session tracking is based on Codex session ids and `~/.codex/sessions/*.jsonl`.
+
+## Hooks
+
+The core does not contain project-specific bootstrap logic.
+
+- `hooks.onCodeTabOpen`
+  - runs when the code/setup tab opens during `run`
+  - runs only when the task card enables `onCodeTabOpen` in `Hooks`
+- `hooks.onClean`
+  - runs before worktree and branch cleanup
+  - runs only when the task card enables `onClean` in `Hooks`
+
+The repository includes a generic example hook:
+
+```bash
+hooks/project-lifecycle.example.sh
+```
+
+This example is intentionally generic. Put private or repository-specific logic in your own hook script outside this repository.
+
+Hook environment variables include:
+
+- `MW_HOOK_EVENT`
+- `MW_TASK_NAME`
+- `MW_TASK_INDEX`
+- `MW_TASK_REPO`
+- `MW_TASK_BRANCH`
+- `MW_TASK_WORKTREE`
+- `MW_TASK_FILE`
+- `MW_TASK_DATE`
+- `MW_TASK_SLUG`
+- `MW_RECORDS_DAY_DIR`
+- `MW_OS_ROOT`
+
+## Agent Sessions And Notifications
+
+MagicWork keeps runtime state outside task cards and lets the terminal layer handle live interaction signals.
+
+In the current `Codex + kitty` setup:
+
+- task runtime state stores the Codex `sessionId`
+- `restore` can reopen the task workspace and resume the same session
+- all task windows are launched against one shared kitty socket
+- when Codex enters a waiting-for-input state, the tab title can change and a kitty notification can be emitted
+- the shared socket also makes fast window switching possible with helpers such as `kls`
+
+These mechanics are implementation-specific, but the pattern is portable to other agents and terminal tools.

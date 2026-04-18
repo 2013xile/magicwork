@@ -10,6 +10,8 @@ summaries/
 
 # Generated daily workspaces and notes
 20??-??-??/
+records-work/
+code-worktrees/
 
 # Optional local scratch
 .tmp/
