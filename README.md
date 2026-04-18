@@ -102,7 +102,7 @@ For automatic summaries and work traces, use this concrete reference from the cu
 - Generate summaries per task, not as one summary for the whole day.
 - Tie summary generation to cleanup and explicit reporting: `clean` can auto-generate a summary before deletion, and `report` can generate or append a summary without cleanup.
 - Keep runtime state small and use the saved session id to go back to the original agent session source when generating summaries.
-- Avoid scraping raw terminal output. Derive summaries from the real agent conversation history so work traces stay reliable.
+- Use the saved `sessionId` to locate the original agent session history and derive summaries from that source so work traces stay reliable.
 
 Extensibility:
 - Do not hardcode project-specific repository logic into the core.
@@ -382,9 +382,30 @@ MagicWork treats task cards as static configuration and keeps runtime state else
 - Active task state is stored under `osRoot`
 - `index.md` shows the current `sessionId` when available
 - `restore` resumes the saved session if the current agent supports session resume
-- Summaries are generated from the original session source instead of terminal transcript scraping
+- Summaries are generated from the original agent session history referenced by `sessionId`
 
 In the current reference implementation, session tracking is based on Codex session ids and `~/.codex/sessions/*.jsonl`.
+
+## Summaries And Work Traces
+
+MagicWork treats summaries and work traces as part of the workflow design, not as an afterthought.
+
+The core idea is:
+
+- keep task cards as stable input
+- keep runtime state lightweight
+- keep the original agent session as the source of truth
+- generate summaries per task instead of writing one large summary for the whole day
+
+In practice, this means:
+
+- the system stores the task `sessionId` in runtime state instead of copying full conversation logs into task cards
+- `report` can generate or append a task summary without destroying the workspace
+- `clean` can generate a final task summary before removing the worktree and branch
+- summaries are written under `summaries/` so they remain separate from task configuration
+- when a summary is needed, the system uses that `sessionId` to locate the original Codex session record and derives the summary from that history
+
+This keeps task cards clean while preserving a reliable path back to the original agent conversation for reporting and review.
 
 ## Hooks
 
