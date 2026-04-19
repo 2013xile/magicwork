@@ -218,6 +218,7 @@ function runLaunch(args) {
 
   if (!options.dryRun) {
     upsertActiveTasks(project.osRoot, launched, context.date);
+    writeDayIndex(context.recordsDayDir, context.date, project.osRoot);
   }
 }
 
@@ -278,6 +279,10 @@ function runClean(args) {
     console.log(`   removed branch: ${task.newBranch}`);
     console.log(`   removed worktree: ${task.worktreePath}`);
   }
+
+  if (!options.dryRun) {
+    writeDayIndex(context.recordsDayDir, context.date, project.osRoot);
+  }
 }
 
 function runFinish(args) {
@@ -321,9 +326,13 @@ function runFinish(args) {
 
     ensureProjectDirs(project, { os: true, records: true });
     console.log(`finish: start task ${task.index} ${task.name}`);
-    console.log(`finish: writing summary ${summaryPath}`);
-    const summaryMarkdown = generateTaskSummary(task);
-    appendTaskSummary(summaryPath, task, summaryMarkdown);
+    if (hasSummaryContext(task)) {
+      console.log(`finish: writing summary ${summaryPath}`);
+      const summaryMarkdown = generateTaskSummary(task);
+      appendTaskSummary(summaryPath, task, summaryMarkdown);
+    } else {
+      console.log(`finish: skip summary, no usable worktree or session record`);
+    }
     console.log(`finish: marking task done ${task.taskFilePath}`);
     updateTaskCardStatus(task.taskFilePath, 'done');
     if (taskAllowsHook(task, 'onClean')) {
@@ -334,6 +343,10 @@ function runFinish(args) {
     console.log(`finish: removing active state ${task.newBranch}`);
     removeActiveTasks(project.osRoot, [task.newBranch]);
     console.log(`finish: finished task ${task.index} ${task.name}`);
+  }
+
+  if (!options.dryRun) {
+    writeDayIndex(context.recordsDayDir, context.date, project.osRoot);
   }
 }
 
@@ -448,8 +461,10 @@ function runReport(args) {
     }
 
     ensureProjectDirs(project, { records: true, os: true });
-    if (!fs.existsSync(task.worktreePath) || !isGitRepo(task.worktreePath)) {
-      throw new Error(`Worktree does not exist for ${task.name}: ${task.worktreePath}`);
+    if (!hasSummaryContext(task)) {
+      console.log(`${task.index}. ${task.name}`);
+      console.log('   skip: no usable worktree or session record');
+      continue;
     }
 
     ensureDir(path.dirname(recordPath));
@@ -1217,6 +1232,14 @@ function buildTaskConversationContext(task) {
   return { sessionId: task.sessionId, rolloutPath, readablePath };
 }
 
+function hasConversationContext(task) {
+  if (!task.sessionId) {
+    return false;
+  }
+  const rolloutPath = findCodexRolloutPath(task.sessionId);
+  return !!(rolloutPath && fs.existsSync(rolloutPath));
+}
+
 function cleanupConversationContext(context) {
   if (context?.readablePath && fs.existsSync(context.readablePath)) {
     fs.unlinkSync(context.readablePath);
@@ -1320,12 +1343,17 @@ function extractMessageText(content) {
 function generateTaskSummary(task) {
   const tempOutputPath = path.join('/tmp', `magicwork-summary-${Date.now()}-${process.pid}.md`);
   const conversationContext = buildTaskConversationContext(task);
+  const useWorktree = hasUsableWorktree(task);
   const prompt = [
-    'Review the current repository state and the Codex conversation record, then write a concise task summary in Markdown.',
+    useWorktree
+      ? 'Review the current repository state and the Codex conversation record, then write a concise task summary in Markdown.'
+      : 'Review the Codex conversation record only, then write a concise task summary in Markdown.',
     `Task session id: ${task.sessionId || '(missing)'}`,
     conversationContext
       ? `Readable conversation path: ${conversationContext.readablePath}`
-      : `No Codex conversation record is available. Continue using only the repository state for ${task.worktreePath}.`,
+      : useWorktree
+        ? `No Codex conversation record is available. Continue using only the repository state for ${task.worktreePath}.`
+        : 'No Codex conversation record is available.',
     'Use exactly these sections and nothing else:',
     '### Summary',
     '- bullet points only',
@@ -1335,19 +1363,23 @@ function generateTaskSummary(task) {
     '- bullet points only',
     '### Next',
     '- bullet points only',
-    'Focus on what was attempted, what changed, validation status, blockers, and what should happen next.',
+    useWorktree
+      ? 'Focus on what was attempted, what changed, validation status, blockers, and what should happen next.'
+      : 'Focus on what was attempted, decisions made, validation mentioned in the conversation, blockers, and what should happen next. If files cannot be confirmed from the conversation, say so briefly in the Files section.',
   ].join('\n');
 
   try {
-    const result = spawnSync('codex', [
+    const args = [
       'exec',
       '--dangerously-bypass-approvals-and-sandbox',
-      '-C',
-      task.worktreePath,
       '--output-last-message',
       tempOutputPath,
       prompt,
-    ], {
+    ];
+    if (useWorktree) {
+      args.splice(2, 0, '-C', task.worktreePath);
+    }
+    const result = spawnSync('codex', args, {
       encoding: 'utf8',
     });
 
@@ -1376,12 +1408,17 @@ function generateTaskSummary(task) {
 function generateTaskReport(task) {
   const tempOutputPath = path.join('/tmp', `magicwork-report-${Date.now()}-${process.pid}.md`);
   const conversationContext = buildTaskConversationContext(task);
+  const useWorktree = hasUsableWorktree(task);
   const prompt = [
-    'Review the current repository state and the Codex conversation record, then write a concise task progress report in Markdown.',
+    useWorktree
+      ? 'Review the current repository state and the Codex conversation record, then write a concise task progress report in Markdown.'
+      : 'Review the Codex conversation record only, then write a concise task progress report in Markdown.',
     `Task session id: ${task.sessionId || '(missing)'}`,
     conversationContext
       ? `Readable conversation path: ${conversationContext.readablePath}`
-      : 'No Codex conversation record is available, so rely on repository state only.',
+      : useWorktree
+        ? 'No Codex conversation record is available, so rely on repository state only.'
+        : 'No Codex conversation record is available.',
     'Use exactly these sections and nothing else:',
     '### Summary',
     '- bullet points only',
@@ -1389,19 +1426,23 @@ function generateTaskReport(task) {
     '- bullet points only, use file paths',
     '### Next',
     '- bullet points only',
-    'Focus on the current worktree status, recent code changes, validation status, blockers, and immediate next steps.',
+    useWorktree
+      ? 'Focus on the current worktree status, recent code changes, validation status, blockers, and immediate next steps.'
+      : 'Focus on the current progress described in the conversation, mentioned changes, validation status, blockers, and immediate next steps. If files cannot be confirmed from the conversation, say so briefly in the Files section.',
   ].join('\n');
 
   try {
-    const result = spawnSync('codex', [
+    const args = [
       'exec',
       '--dangerously-bypass-approvals-and-sandbox',
-      '-C',
-      task.worktreePath,
       '--output-last-message',
       tempOutputPath,
       prompt,
-    ], {
+    ];
+    if (useWorktree) {
+      args.splice(2, 0, '-C', task.worktreePath);
+    }
+    const result = spawnSync('codex', args, {
       encoding: 'utf8',
     });
 
@@ -1475,6 +1516,14 @@ function extractSection(markdown, heading) {
   return match ? match[1].trim() : '';
 }
 
+function hasUsableWorktree(task) {
+  return !!(task.worktreePath && fs.existsSync(task.worktreePath) && isGitRepo(task.worktreePath));
+}
+
+function hasSummaryContext(task) {
+  return hasUsableWorktree(task) || hasConversationContext(task);
+}
+
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -1508,7 +1557,7 @@ function ensureWorktree(task) {
 }
 
 function removeWorktreeAndBranch(task, logger = () => {}) {
-  if (fs.existsSync(task.worktreePath) && isGitRepo(task.worktreePath)) {
+  if (hasUsableWorktree(task)) {
     logger(`clean: git worktree remove --force ${task.worktreePath}`);
     const removeResult = runGit(task.repo, ['worktree', 'remove', '--force', task.worktreePath], {
       allowFailure: true,
@@ -1520,6 +1569,8 @@ function removeWorktreeAndBranch(task, logger = () => {}) {
   } else {
     logger(`clean: skip worktree remove, path not an active git worktree: ${task.worktreePath}`);
   }
+
+  pruneStaleWorktrees(task.repo, logger);
 
   if (branchExists(task.repo, task.newBranch)) {
     logger(`clean: git branch -D ${task.newBranch}`);
@@ -1548,14 +1599,16 @@ function findWorktreePathByBranch(repo, branchName) {
   const lines = result.stdout.split('\n');
   let currentWorktree = '';
   let currentBranch = '';
+  let currentPrunable = false;
 
   for (const line of [...lines, '']) {
     if (!line.trim()) {
-      if (currentWorktree && currentBranch === `refs/heads/${branchName}`) {
+      if (currentWorktree && currentBranch === `refs/heads/${branchName}` && !currentPrunable) {
         return currentWorktree;
       }
       currentWorktree = '';
       currentBranch = '';
+      currentPrunable = false;
       continue;
     }
 
@@ -1566,10 +1619,25 @@ function findWorktreePathByBranch(repo, branchName) {
 
     if (line.startsWith('branch ')) {
       currentBranch = line.slice('branch '.length).trim();
+      continue;
+    }
+
+    if (line.startsWith('prunable ')) {
+      currentPrunable = true;
     }
   }
 
   return '';
+}
+
+function pruneStaleWorktrees(repo, logger = () => {}) {
+  logger('clean: git worktree prune');
+  const pruneResult = runGit(repo, ['worktree', 'prune'], {
+    allowFailure: true,
+  });
+  if (pruneResult.status !== 0) {
+    throw new Error(pruneResult.stderr.trim() || `Failed to prune worktrees for ${repo}`);
+  }
 }
 
 function launchKittyTab(task, socketAddress, project, { sendPrompt = true, trigger = 'run' } = {}) {
