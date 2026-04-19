@@ -231,6 +231,9 @@ function resolveRunTargets(tasks, rawTargets) {
 
 function runClean(args) {
   const options = parseOptions(args);
+  if (options.noSummary) {
+    fail('clean does not support --no-summary; use finish --no-summary if you want cleanup without summary');
+  }
   const project = resolveProject(options);
   ensureProjectDirs(project, { records: true });
   const inputPath = options._[0] && options._[0].endsWith('.md')
@@ -326,7 +329,9 @@ function runFinish(args) {
 
     ensureProjectDirs(project, { os: true, records: true });
     console.log(`finish: start task ${task.index} ${task.name}`);
-    if (hasSummaryContext(task)) {
+    if (options.noSummary) {
+      console.log('finish: skip summary, --no-summary');
+    } else if (hasSummaryContext(task)) {
       console.log(`finish: writing summary ${summaryPath}`);
       const summaryMarkdown = generateTaskSummary(task);
       appendTaskSummary(summaryPath, task, summaryMarkdown);
@@ -2104,6 +2109,7 @@ function printHelp() {
     '  mw run --dry-run',
     '  mw clean 1 3',
     '  mw finish 1 3',
+    '  mw finish 1 --no-summary',
     '  mw clean 01-task-1',
     '  mw clean magicwork/2026-04-17/01-task-1',
     '  mw clean --all',

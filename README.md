@@ -56,7 +56,10 @@ Required behavior:
   - if a saved session id exists, resume the previous coding-agent session
 - `clean`
   - remove one or more worktrees and branches
-  - optionally generate a summary before cleanup
+- `finish`
+  - generate a final task summary
+  - mark the task as done
+  - then clean up the worktree and branch
   - support `--no-summary`
 - `report`
   - generate or append a summary without cleanup
@@ -100,9 +103,10 @@ For hook support, use this concrete reference from the current repository:
 
 For automatic summaries and work traces, use this concrete reference from the current repository:
 - Generate summaries per task, not as one summary for the whole day.
-- Tie summary generation to cleanup and explicit reporting: `clean` can auto-generate a summary before deletion, and `report` can generate or append a summary without cleanup.
+- Tie summary generation to explicit task actions: `finish` should generate the final summary before cleanup, and `report` can generate or append a summary without cleanup.
 - Keep runtime state small and use the saved session id to go back to the original agent session source when generating summaries.
 - Use the saved `sessionId` to locate the original agent session history and derive summaries from that source so work traces stay reliable.
+- If the worktree is missing but the saved session record still exists, summaries should still be generated from the original agent session source instead of being skipped.
 
 Extensibility:
 - Do not hardcode project-specific repository logic into the core.
@@ -124,7 +128,7 @@ Implementation preferences:
 - Tracks active tasks and saved session ids outside the task cards.
 - Rebuilds a daily `index.md` from task cards.
 - Restores active workspaces later without re-sending the initial prompt.
-- Generates task summaries before cleanup, unless you explicitly skip them.
+- Generates task summaries during `finish`, unless you explicitly skip them with `--no-summary`.
 - Supports project-specific bootstrap and cleanup through lifecycle hooks.
 
 ## Architecture
@@ -175,7 +179,7 @@ Meaning:
   - includes status and session id when available
 - `summaries/*.md`
   - generated task summaries
-  - appended by `report` or `clean`
+  - appended by `report` or `finish`
 
 ## Installation
 
@@ -347,6 +351,7 @@ Finish tasks with summary and cleanup:
 ```bash
 mw finish 1
 mw finish --all
+mw finish 1 --no-summary
 ```
 
 Generate summaries without cleanup:
