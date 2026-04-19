@@ -307,6 +307,8 @@ Launch today’s tasks:
 
 ```bash
 mw run
+mw run 3
+mw run 1 3 5
 ```
 
 By default, `mw run` launches only tasks that have not been launched before. To relaunch already active tasks, use:
@@ -335,7 +337,16 @@ Clean worktrees and branches:
 ```bash
 mw clean 1 3
 mw clean --all
-mw clean 1 3 --no-summary
+mw finish 1 3
+```
+
+`mw clean` only removes runtime state, worktrees, and branches. It does not mark a task as done.
+
+Finish tasks with summary and cleanup:
+
+```bash
+mw finish 1
+mw finish --all
 ```
 
 Generate summaries without cleanup:
@@ -352,7 +363,7 @@ Example:
 ````md
 ---
 name: "Fix auth button"
-enabled: true
+status: "todo"
 workdir: "/path/to/repo"
 baseBranch: "main"
 newBranch: ""
@@ -369,7 +380,10 @@ Read the relevant page, locate the root cause, implement the fix, and verify it.
 Notes:
 
 - front matter is the task configuration source
-- `enabled: true` means the task participates in `run`
+- `status` uses `todo | doing | done`
+- `status: "done"` means the task is finished and will not be launched by `run`
+- `run` promotes `todo` tasks to `doing`
+- a task with an empty `prompt` stays as a draft and will not be launched by `run`
 - `prompt` is the initial agent prompt
 - `newBranch` can be left empty for auto-generation
 - `hooks` controls which lifecycle hook events are enabled for that task
@@ -401,7 +415,8 @@ In practice, this means:
 
 - the system stores the task `sessionId` in runtime state instead of copying full conversation logs into task cards
 - `report` can generate or append a task summary without destroying the workspace
-- `clean` can generate a final task summary before removing the worktree and branch
+- `finish` generates a final task summary, marks the task as done, and then cleans up the workspace
+- `clean` only clears runtime state and local worktree resources without marking the task as done
 - summaries are written under `summaries/` so they remain separate from task configuration
 - when a summary is needed, the system uses that `sessionId` to locate the original Codex session record and derives the summary from that history
 

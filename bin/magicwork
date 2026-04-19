@@ -27,7 +27,10 @@ function main() {
   try {
     switch (command) {
       case 'init':
-        runInit(commandArgs);
+        runInit(commandArgs, { defaultCount: TEMPLATE_TASK_COUNT });
+        break;
+      case 'add':
+        runInit(commandArgs, { defaultCount: 1 });
         break;
       case 'run':
         runLaunch(commandArgs);
@@ -37,6 +40,9 @@ function main() {
         break;
       case 'clean':
         runClean(commandArgs);
+        break;
+      case 'finish':
+        runFinish(commandArgs);
         break;
       case 'report':
         runReport(commandArgs);
@@ -82,7 +88,7 @@ function extractGlobalOptions(argv) {
   return { args, options };
 }
 
-function runInit(args) {
+function runInit(args, { defaultCount = TEMPLATE_TASK_COUNT } = {}) {
   const options = parseOptions(args);
   const date = options.date || todayLocal();
   const project = resolveProject(options);
@@ -95,7 +101,8 @@ function runInit(args) {
   const activeTasks = options.noCarryActive ? [] : readActiveTasks(project.osRoot);
   const existingCards = listTaskCardFiles(dayDir);
   const nextIndexStart = existingCards.length + 1;
-  const cardCount = existingCards.length ? TEMPLATE_TASK_COUNT : Math.max(TEMPLATE_TASK_COUNT, activeTasks.length);
+  const requestedCount = resolveInitCardCount(options);
+  const cardCount = requestedCount || (existingCards.length ? defaultCount : Math.max(defaultCount, activeTasks.length));
   const createdFiles = createTaskCards({
     dayDir,
     startIndex: nextIndexStart,
@@ -112,12 +119,31 @@ function runInit(args) {
   console.log(indexPath);
 }
 
+function resolveInitCardCount(options) {
+  const raw = options.count ?? options._[0];
+  if (raw == null || raw === '') {
+    return 0;
+  }
+  if (!/^\d+$/.test(String(raw))) {
+    fail(`Invalid task count: ${raw}`);
+  }
+  const count = Number(raw);
+  if (count <= 0) {
+    fail(`Task count must be greater than 0: ${raw}`);
+  }
+  return count;
+}
+
 function runLaunch(args) {
   const options = parseOptions(args);
   const project = resolveProject(options);
   ensureProjectDirs(project, { records: true });
-  let inputPath = options._[0]
-    ? path.resolve(options._[0])
+  const rawArgs = [...options._];
+  const firstArg = rawArgs[0] ? path.resolve(rawArgs[0]) : '';
+  const hasExplicitInputPath = !!firstArg && fs.existsSync(firstArg) && !!inferDayDirFromTaskPath(firstArg);
+  const targetArgs = hasExplicitInputPath ? rawArgs.slice(1) : rawArgs;
+  let inputPath = hasExplicitInputPath
+    ? firstArg
     : resolveDefaultTaskFile(options.date, project.recordsDir);
   if (!fs.existsSync(inputPath)) {
     fail(`Task file not found: ${inputPath}`);
@@ -141,13 +167,14 @@ function runLaunch(args) {
   }
 
   const allResolvedTasks = context.tasks.map((task) => resolveTask(context, task));
+  const selectedTasks = targetArgs.length ? resolveRunTargets(allResolvedTasks, targetArgs) : allResolvedTasks;
   const activeBranches = new Set(readActiveTasks(project.osRoot).map((task) => task.newBranch));
   const tasksToLaunch = options.rerunLaunched
-    ? allResolvedTasks
-    : allResolvedTasks.filter((task) => !activeBranches.has(task.newBranch));
+    ? selectedTasks
+    : selectedTasks.filter((task) => !activeBranches.has(task.newBranch));
   const skippedTasks = options.rerunLaunched
     ? []
-    : allResolvedTasks.filter((task) => activeBranches.has(task.newBranch));
+    : selectedTasks.filter((task) => activeBranches.has(task.newBranch));
 
   if (!tasksToLaunch.length) {
     console.log(`run: using ${inputPath}`);
@@ -161,6 +188,10 @@ function runLaunch(args) {
   const launched = [];
   for (const resolved of tasksToLaunch) {
     if (!options.dryRun) {
+      if (resolved.status === 'todo') {
+        updateTaskCardStatus(resolved.taskFilePath, 'doing');
+        resolved.status = 'doing';
+      }
       ensureWorktree(resolved);
       launchKittyTab(resolved, socketAddress, project, { sendPrompt: true, trigger: 'run' });
     }
@@ -188,6 +219,13 @@ function runLaunch(args) {
   if (!options.dryRun) {
     upsertActiveTasks(project.osRoot, launched, context.date);
   }
+}
+
+function resolveRunTargets(tasks, rawTargets) {
+  if (!rawTargets.length) {
+    return tasks;
+  }
+  return resolveCleanTargets(tasks, rawTargets);
 }
 
 function runClean(args) {
@@ -218,10 +256,8 @@ function runClean(args) {
   console.log(`clean: using ${inputPath}`);
   console.log(`clean: matched ${targets.length} task(s)`);
   for (const task of targets) {
-    const summaryPath = taskSummaryPath(task);
     if (options.dryRun) {
       console.log(`${task.index}. ${task.name}`);
-      console.log(`   summary: ${options.noSummary ? 'skipped (--no-summary)' : summaryPath}`);
       console.log(`   branch: ${task.newBranch}`);
       console.log(`   worktree: ${task.worktreePath}`);
       console.log('   mode: dry-run');
@@ -230,13 +266,6 @@ function runClean(args) {
 
     ensureProjectDirs(project, { os: true, records: true });
     console.log(`clean: start task ${task.index} ${task.name}`);
-    if (options.noSummary) {
-      console.log('clean: skip summary (--no-summary)');
-    } else {
-      console.log(`clean: writing summary ${summaryPath}`);
-      const summaryMarkdown = generateTaskSummary(task);
-      appendTaskSummary(summaryPath, task, summaryMarkdown);
-    }
     if (taskAllowsHook(task, 'onClean')) {
       runLifecycleHook(project.hooks.onClean, 'onClean', task, { logger: console.log });
     }
@@ -248,6 +277,63 @@ function runClean(args) {
     console.log(`${task.index}. ${task.name}`);
     console.log(`   removed branch: ${task.newBranch}`);
     console.log(`   removed worktree: ${task.worktreePath}`);
+  }
+}
+
+function runFinish(args) {
+  const options = parseOptions(args);
+  const project = resolveProject(options);
+  ensureProjectDirs(project, { records: true });
+  const inputPath = options._[0] && options._[0].endsWith('.md')
+    ? path.resolve(options._.shift())
+    : resolveDefaultTaskFile(options.date, project.recordsDir);
+
+  if (!fs.existsSync(inputPath)) {
+    fail(`Task file not found: ${inputPath}`);
+  }
+
+  const content = fs.readFileSync(inputPath, 'utf8');
+  const context = parseTaskFile(content, inputPath, project);
+  const tasks = context.tasks.map((task) => resolveTask(context, task));
+
+  if (!tasks.length) {
+    fail(`No runnable tasks found in ${inputPath}`);
+  }
+
+  const targets = options.all ? tasks : resolveCleanTargets(tasks, options._);
+  if (!targets.length) {
+    fail('No matching worktrees to finish');
+  }
+
+  console.log(`finish: using ${inputPath}`);
+  console.log(`finish: matched ${targets.length} task(s)`);
+  for (const task of targets) {
+    const summaryPath = taskSummaryPath(task);
+    if (options.dryRun) {
+      console.log(`${task.index}. ${task.name}`);
+      console.log(`   summary: ${summaryPath}`);
+      console.log(`   status: done`);
+      console.log(`   branch: ${task.newBranch}`);
+      console.log(`   worktree: ${task.worktreePath}`);
+      console.log('   mode: dry-run');
+      continue;
+    }
+
+    ensureProjectDirs(project, { os: true, records: true });
+    console.log(`finish: start task ${task.index} ${task.name}`);
+    console.log(`finish: writing summary ${summaryPath}`);
+    const summaryMarkdown = generateTaskSummary(task);
+    appendTaskSummary(summaryPath, task, summaryMarkdown);
+    console.log(`finish: marking task done ${task.taskFilePath}`);
+    updateTaskCardStatus(task.taskFilePath, 'done');
+    if (taskAllowsHook(task, 'onClean')) {
+      runLifecycleHook(project.hooks.onClean, 'onClean', task, { logger: console.log });
+    }
+    console.log(`finish: removing worktree ${task.worktreePath}`);
+    removeWorktreeAndBranch(task, (message) => console.log(message.replace(/^clean:/, 'finish:')));
+    console.log(`finish: removing active state ${task.newBranch}`);
+    removeActiveTasks(project.osRoot, [task.newBranch]);
+    console.log(`finish: finished task ${task.index} ${task.name}`);
   }
 }
 
@@ -463,6 +549,10 @@ function parseOptions(args) {
       options.date = args[++index];
       continue;
     }
+    if (token === '--count') {
+      options.count = args[++index];
+      continue;
+    }
     if (token === '--socket') {
       options.socket = args[++index];
       continue;
@@ -617,7 +707,7 @@ function buildTaskCard(index, activeTask, defaultRepo, defaultBaseBranch) {
   return [
     '---',
     `name: ${yamlScalar(activeTask?.name || `Task ${index}`)}`,
-    `enabled: ${activeTask ? 'true' : 'false'}`,
+    `status: ${yamlScalar(activeTask?.status || 'todo')}`,
     `workdir: ${yamlScalar(activeTask?.repo || defaultRepo)}`,
     `baseBranch: ${yamlScalar(activeTask?.baseBranch || defaultBaseBranch)}`,
     `newBranch: ${yamlScalar(activeTask?.newBranch || '')}`,
@@ -626,7 +716,7 @@ function buildTaskCard(index, activeTask, defaultRepo, defaultBaseBranch) {
     '---',
     '',
     '```prompt',
-    activeTask?.prompt || 'Fill the prompt for this task.',
+    normalizePromptContent(activeTask?.prompt || ''),
     '```',
     '',
   ].join('\n');
@@ -678,7 +768,7 @@ function parseTaskCardsFromDayDir(dayDir, project) {
   for (const filePath of files) {
     const content = fs.readFileSync(filePath, 'utf8');
     const parsed = parseTaskCard(content, filePath);
-    if (parsed.enabled) {
+    if (isTaskRunnable(parsed.task)) {
       const activeTask = activeByBranch.get(parsed.task.newBranch || '');
       tasks.push({
         ...parsed.task,
@@ -704,7 +794,7 @@ function parseSingleTaskCard(content, filePath, project) {
     codeDayDir,
     osRoot: project.osRoot,
     defaultRepo: project.defaultRepo || '',
-    tasks: parsed.enabled ? [{
+    tasks: isTaskRunnable(parsed.task) ? [{
       ...parsed.task,
       sessionId: activeTask?.sessionId || '',
     }] : [],
@@ -713,17 +803,14 @@ function parseSingleTaskCard(content, filePath, project) {
 
 function parseTaskCard(content, filePath) {
   const fields = parseFrontMatter(content);
-  const prompt = parsePrompt(content);
+  const prompt = normalizePromptContent(parsePrompt(content));
   const index = inferTaskIndex(filePath, fields.name);
-  const enabled = parseBoolean(fields.enabled || 'false');
-  if (enabled && !prompt.trim()) {
-    throw new Error(`Task ${index} is enabled but prompt is empty`);
-  }
+  const status = normalizeTaskStatus(fields.status || 'todo');
   return {
-    enabled,
     task: {
       index,
       name: fields.name || `Task ${index}`,
+      status,
       repo: fields.workdir || '',
       baseBranch: fields.baseBranch || '',
       newBranch: fields.newBranch || '',
@@ -732,6 +819,29 @@ function parseTaskCard(content, filePath) {
       taskFilePath: filePath,
     },
   };
+}
+
+function normalizeTaskStatus(value) {
+  const status = String(value || 'todo').trim().toLowerCase();
+  if (status === 'doing') {
+    return 'doing';
+  }
+  if (status === 'done') {
+    return 'done';
+  }
+  return 'todo';
+}
+
+function normalizePromptContent(value) {
+  const text = String(value || '').trim();
+  if (text === 'Fill the prompt for this task.') {
+    return '';
+  }
+  return text;
+}
+
+function isTaskRunnable(task) {
+  return task.status !== 'done' && !!String(task.prompt || '').trim();
 }
 
 function defaultTaskHookEvents() {
@@ -790,15 +900,18 @@ function writeDayIndex(dayDir, date, osRoot) {
     const parsed = parseTaskCard(fs.readFileSync(filePath, 'utf8'), filePath);
     const task = parsed.task;
     const activeTask = activeByBranch.get(task.newBranch || '');
-    const status = !parsed.enabled
-      ? 'disabled'
+    const status = task.status === 'done'
+      ? 'done'
+      : !task.prompt
+      ? 'draft'
       : activeBranches.has(task.newBranch)
         ? 'active'
-        : 'ready';
+        : task.status === 'doing'
+          ? 'doing'
+          : 'todo';
     return {
       index: task.index,
       name: task.name,
-      enabled: parsed.enabled,
       status,
       branch: task.newBranch || '(auto)',
       sessionId: activeTask?.sessionId || '',
@@ -994,6 +1107,18 @@ function yamlScalar(value) {
   return JSON.stringify(str);
 }
 
+function updateTaskCardStatus(filePath, status) {
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const nextStatus = normalizeTaskStatus(status);
+  if (/^status:\s*/m.test(raw)) {
+    const updated = raw.replace(/^status:\s*.*$/m, `status: ${yamlScalar(nextStatus)}`);
+    fs.writeFileSync(filePath, updated, 'utf8');
+    return;
+  }
+  const updated = raw.replace(/^name:\s*.*$/m, (line) => `${line}\nstatus: ${yamlScalar(nextStatus)}`);
+  fs.writeFileSync(filePath, updated, 'utf8');
+}
+
 function parsePrompt(section) {
   const match = section.match(/```prompt\s*\n([\s\S]*?)\n```/);
   return match ? match[1] : '';
@@ -1021,7 +1146,9 @@ function resolveTask(context, task) {
   const slug = slugify(task.name, task.index);
   const newBranch = task.newBranch || `magicwork/${context.date}/${String(task.index).padStart(2, '0')}-${slug}`;
   const worktreeDirName = `${String(task.index).padStart(2, '0')}-${slug}`;
-  const worktreePath = path.join(context.codeDayDir, worktreeDirName);
+  const expectedWorktreePath = path.join(context.codeDayDir, worktreeDirName);
+  const existingWorktreePath = findWorktreePathByBranch(repo, newBranch);
+  const worktreePath = existingWorktreePath || expectedWorktreePath;
 
   return {
     ...task,
@@ -1459,6 +1586,19 @@ function launchKittyTab(task, socketAddress, project, { sendPrompt = true, trigg
     '-C',
     task.worktreePath,
   ];
+  const taskEnv = {
+    MW_TASK_NAME: task.name,
+    MW_TASK_INDEX: String(task.index),
+    MW_TASK_BRANCH: task.newBranch,
+    MW_TASK_REPO: task.repo,
+    MW_TASK_WORKTREE: task.worktreePath,
+    MW_TASK_FILE: task.taskFilePath || '',
+    MW_TASK_DATE: task.date,
+    MW_TRIGGER: trigger,
+    MW_OS_ROOT: task.osRoot || '',
+    MW_RECORDS_DAY_DIR: task.recordsDayDir || '',
+    MW_CODE_DIR: project.codeDir || '',
+  };
   const shouldResumeSession = trigger === 'restore' && !!task.sessionId;
   const codexCommand = shouldResumeSession
     ? [
@@ -1492,20 +1632,11 @@ function launchKittyTab(task, socketAddress, project, { sendPrompt = true, trigg
         MW_CODEX_CWD: task.worktreePath,
         MW_TAB_TITLE: codexTabTitle,
         MW_SOCKET: socketAddress,
-        MW_TASK_NAME: task.name,
-        MW_TASK_INDEX: String(task.index),
-        MW_TASK_BRANCH: task.newBranch,
-        MW_TASK_REPO: task.repo,
-        MW_TASK_WORKTREE: task.worktreePath,
-        MW_TASK_FILE: task.taskFilePath || '',
-        MW_TASK_DATE: task.date,
         MW_INITIAL_PROMPT: sendPrompt ? task.prompt : '',
-        MW_TRIGGER: trigger,
         MW_HOOK_EVENT: trigger === 'run' && project.hooks.onCodeTabOpen && taskAllowsHook(task, 'onCodeTabOpen') ? 'onCodeTabOpen' : '',
         MW_MAGICWORK_BIN: path.join(__dirname, 'magicwork'),
         MW_REGISTER_SESSION_SCRIPT: REGISTER_SESSION_SCRIPT,
-        MW_OS_ROOT: task.osRoot || '',
-        MW_RECORDS_DAY_DIR: task.recordsDayDir || '',
+        ...taskEnv,
       },
     },
     codexCommand,
@@ -1538,6 +1669,11 @@ function launchKittyTab(task, socketAddress, project, { sendPrompt = true, trigg
       hold: true,
       match: `window_id:${codexWindowIdText}`,
       keepFocus: true,
+      env: {
+        MW_ROLE: 'code',
+        MW_HOOK_EVENT: trigger === 'run' && project.hooks.onCodeTabOpen && taskAllowsHook(task, 'onCodeTabOpen') ? 'onCodeTabOpen' : '',
+        ...taskEnv,
+      },
     },
     buildCodeTabCommand(task, project, trigger),
     task.name,
@@ -1583,18 +1719,18 @@ function launchKittyWindow(socketAddress, options, command, taskName) {
 function buildCodeTabCommand(task, project, trigger) {
   const hookPath = project.hooks.onCodeTabOpen;
   if (!hookPath || trigger !== 'run' || !taskAllowsHook(task, 'onCodeTabOpen')) {
-    return [defaultShell(), '-l'];
+    return [defaultShell(), '-il'];
   }
   if (!fs.existsSync(hookPath)) {
     throw new Error(`Configured hook not found: ${hookPath}`);
   }
 
-  return [defaultShell(), '-lc', buildHookShellCommand(hookPath, 'onCodeTabOpen')];
+  return [defaultShell(), '-ilc', buildHookShellCommand(hookPath, 'onCodeTabOpen')];
 }
 
 function buildHookShellCommand(hookPath, eventName) {
   const shellPath = shellEscape(defaultShell());
-  return `${shellEscape(hookPath)} ${shellEscape(eventName)}; exec ${shellPath} -l`;
+  return `${shellEscape(hookPath)} ${shellEscape(eventName)}; exec ${shellPath} -il`;
 }
 
 function runLifecycleHook(hookPath, eventName, task, { logger = () => {} } = {}) {
@@ -1870,10 +2006,12 @@ function printHelp() {
     '',
     'Commands:',
     '  init [--date YYYY-MM-DD]     Create a daily Markdown task template',
+    '  add [--date YYYY-MM-DD]      Append more task cards for the day',
     '  run [file] [--date ...]      Create worktrees and launch task workspaces',
     '  sync [--date YYYY-MM-DD]     Rebuild index.md from task cards',
     '  restore [targets...]         Reopen active task workspaces without init or prompt',
     '  clean [file] [targets...]    Remove worktrees and their branches',
+    '  finish [file] [targets...]   Summarize, mark done, and clean tasks',
     '  report [file] [targets...]   Summarize task progress into records/',
     '  config [show|init]           Show or create config in osRoot',
     '',
@@ -1882,16 +2020,22 @@ function printHelp() {
     `  mw config init --os-root ~/.config/magicwork --records-dir ~/magicwork/records --code-dir ~/magicwork/code --default-repo /path/to/repo --hook-on-code-tab-open ${EXAMPLE_HOOK_SCRIPT} --hook-on-clean ${EXAMPLE_HOOK_SCRIPT}`,
     '  mw config show',
     '  mw init',
+    '  mw init 3',
+    '  mw init --count 3',
+    '  mw add',
+    '  mw add 3',
     '  mw init --no-carry-active',
     '  mw sync --date 2026-04-18',
     '  mw run',
+    '  mw run 3',
+    '  mw run 1 3 5',
     '  mw run --rerun-launched',
     '  mw restore',
     '  mw restore 1 3',
     '  mw restore task-3512',
     '  mw run --dry-run',
     '  mw clean 1 3',
-    '  mw clean 1 3 --no-summary',
+    '  mw finish 1 3',
     '  mw clean 01-task-1',
     '  mw clean magicwork/2026-04-17/01-task-1',
     '  mw clean --all',
