@@ -10,6 +10,7 @@ const CONFIG_FILE = 'config.json';
 const ACTIVE_STATE_FILE = '.magicwork-active.json';
 const SESSION_STATE_FILE = '.magicwork-sessions.json';
 const RECORDS_DIR = 'records';
+const RESERVED_TASK_FIELDS = new Set(['name', 'status', 'workdir', 'baseBranch', 'newBranch', 'hooks']);
 const CODEX_NOTIFY_SCRIPT = path.join(__dirname, 'codex_notify.py');
 const CODEX_WATCHER_SCRIPT = path.join(__dirname, 'kitty_codex_watcher.py');
 const CODEX_SESSION_SCRIPT = path.join(__dirname, 'codex_session.sh');
@@ -113,6 +114,7 @@ function runInit(args, { defaultCount = TEMPLATE_TASK_COUNT } = {}) {
     date,
     defaultRepo,
     defaultBaseBranch,
+    taskTemplate: project.taskTemplate || {},
   });
   for (const filePath of createdFiles) {
     console.log(filePath);
@@ -189,6 +191,9 @@ function runLaunch(args) {
         resolved.status = 'doing';
       }
       ensureWorktree(resolved);
+      if (taskAllowsHook(resolved, 'onBeforeLaunch')) {
+        runLifecycleHook(project.hooks.onBeforeLaunch, 'onBeforeLaunch', resolved, { logger: console.log });
+      }
       launchKittyTab(resolved, socketAddress, project, { sendPrompt: true, trigger: 'run' });
     }
     launched.push(resolved);
@@ -369,11 +374,13 @@ function runRestore(args) {
       baseBranch: activeTask.baseBranch || detectCurrentBranch(activeTask.repo) || 'main',
       newBranch: activeTask.newBranch,
       hookEvents: Array.isArray(activeTask.hookEvents) ? activeTask.hookEvents : defaultTaskHookEvents(),
+      meta: isPlainObject(activeTask.meta) ? cloneJsonValue(activeTask.meta) : {},
       sessionId: activeTask.sessionId || '',
       prompt: activeTask.prompt,
       slug: slugify(activeTask.name, index + 1),
       date: activeTask.lastDate || todayLocal(),
       recordsDayDir: path.join(project.recordsDir, activeTask.lastDate || todayLocal()),
+      codeDir: project.codeDir,
       osRoot: project.osRoot,
       worktreePath,
     });
@@ -614,6 +621,7 @@ function runConfig(args) {
       recordsDir: project.recordsDir || null,
       codeDir: project.codeDir || null,
       defaultRepo: project.defaultRepo || null,
+      taskTemplate: project.taskTemplate,
       hooks: project.hooks,
     }, null, 2));
     return;
@@ -630,6 +638,7 @@ function runConfig(args) {
       codeDir: options.codeDir,
       defaultRepo: options.defaultRepo || '',
       hooks: {
+        onBeforeLaunch: options.hookOnBeforeLaunch || '',
         onCodeTabOpen: options.hookOnCodeTabOpen || '',
         onClean: options.hookOnClean || '',
       },
@@ -741,6 +750,10 @@ function parseOptions(args) {
       options.hookOnCodeTabOpen = args[++index];
       continue;
     }
+    if (token === '--hook-on-before-launch') {
+      options.hookOnBeforeLaunch = args[++index];
+      continue;
+    }
     if (token === '--hook-on-clean') {
       options.hookOnClean = args[++index];
       continue;
@@ -791,7 +804,7 @@ function tasksDir(dayDir) {
   return path.join(dayDir, 'tasks');
 }
 
-function createTaskCards({ dayDir, startIndex, count, activeTasks, defaultRepo, defaultBaseBranch }) {
+function createTaskCards({ dayDir, startIndex, count, activeTasks, defaultRepo, defaultBaseBranch, taskTemplate }) {
   const createdFiles = [];
   for (let offset = 0; offset < count; offset += 1) {
     const index = startIndex + offset;
@@ -801,22 +814,36 @@ function createTaskCards({ dayDir, startIndex, count, activeTasks, defaultRepo, 
     if (fs.existsSync(filePath)) {
       continue;
     }
-    fs.writeFileSync(filePath, buildTaskCard(index, activeTask, defaultRepo, defaultBaseBranch), 'utf8');
+    fs.writeFileSync(filePath, buildTaskCard(index, activeTask, defaultRepo, defaultBaseBranch, taskTemplate), 'utf8');
     createdFiles.push(filePath);
   }
   return createdFiles;
 }
 
-function buildTaskCard(index, activeTask, defaultRepo, defaultBaseBranch) {
+function buildTaskCard(index, activeTask, defaultRepo, defaultBaseBranch, taskTemplate = {}) {
+  const template = isPlainObject(taskTemplate) ? cloneJsonValue(taskTemplate) : {};
+  const templateFields = { ...template };
+  const templateHooks = formatTaskHookEvents(templateFields.hooks);
+  delete templateFields.hooks;
+  const meta = {
+    ...pickCustomTaskFields(templateFields),
+    ...pickCustomTaskFields(activeTask?.meta),
+  };
+  const frontMatter = {
+    name: activeTask?.name || template.name || `Task ${index}`,
+    status: activeTask?.status || template.status || 'todo',
+    workdir: activeTask?.repo || template.workdir || defaultRepo,
+    baseBranch: activeTask?.baseBranch || template.baseBranch || defaultBaseBranch,
+    newBranch: activeTask?.newBranch || template.newBranch || '',
+    hooks: Array.isArray(activeTask?.hookEvents) && activeTask.hookEvents.length
+      ? activeTask.hookEvents
+      : templateHooks,
+    ...meta,
+  };
+
   return [
     '---',
-    `name: ${yamlScalar(activeTask?.name || `Task ${index}`)}`,
-    `status: ${yamlScalar(activeTask?.status || 'todo')}`,
-    `workdir: ${yamlScalar(activeTask?.repo || defaultRepo)}`,
-    `baseBranch: ${yamlScalar(activeTask?.baseBranch || defaultBaseBranch)}`,
-    `newBranch: ${yamlScalar(activeTask?.newBranch || '')}`,
-    'hooks:',
-    ...formatTaskHookEvents(activeTask?.hookEvents).map((event) => `  - ${event}`),
+    ...renderYamlMapping(frontMatter),
     '---',
     '',
     '```prompt',
@@ -878,7 +905,15 @@ function parseTaskCardsFromDayDir(dayDir, project, options = {}) {
     }
   }
 
-  return { date, recordsDayDir: dayDir, codeDayDir, osRoot: project.osRoot, defaultRepo: project.defaultRepo || '', tasks };
+  return {
+    date,
+    recordsDayDir: dayDir,
+    codeDayDir,
+    codeDir: project.codeDir,
+    osRoot: project.osRoot,
+    defaultRepo: project.defaultRepo || '',
+    tasks,
+  };
 }
 
 function parseSingleTaskCard(content, filePath, project, options = {}) {
@@ -895,6 +930,7 @@ function parseSingleTaskCard(content, filePath, project, options = {}) {
     date,
     recordsDayDir: dayDir,
     codeDayDir,
+    codeDir: project.codeDir,
     osRoot: project.osRoot,
     defaultRepo: project.defaultRepo || '',
     tasks: isTaskSelectable(parsed.task, { includeDone }) ? [{
@@ -918,6 +954,7 @@ function parseTaskCard(content, filePath) {
       baseBranch: fields.baseBranch || '',
       newBranch: fields.newBranch || '',
       hookEvents: parseTaskHookEvents(fields.hooks),
+      meta: pickCustomTaskFields(fields),
       prompt: prompt.trim(),
       taskFilePath: filePath,
     },
@@ -960,10 +997,14 @@ function isTaskSelectable(task, options = {}) {
 }
 
 function defaultTaskHookEvents() {
-  return ['onCodeTabOpen', 'onClean'];
+  return ['onBeforeLaunch', 'onCodeTabOpen', 'onClean'];
 }
 
 function parseTaskHookEvents(raw) {
+  if (Array.isArray(raw)) {
+    const values = raw.map((item) => String(item).trim()).filter(Boolean);
+    return values.length ? values : defaultTaskHookEvents();
+  }
   if (!raw || !String(raw).trim()) {
     return defaultTaskHookEvents();
   }
@@ -977,10 +1018,30 @@ function formatTaskHookEvents(events) {
   return Array.isArray(events) && events.length ? events : defaultTaskHookEvents();
 }
 
+function pickCustomTaskFields(fields) {
+  if (!isPlainObject(fields)) {
+    return {};
+  }
+  const result = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (RESERVED_TASK_FIELDS.has(key)) {
+      continue;
+    }
+    result[key] = cloneJsonValue(value);
+  }
+  return result;
+}
+
 function taskAllowsHook(task, eventName) {
   const events = Array.isArray(task.hookEvents) && task.hookEvents.length
     ? task.hookEvents
     : defaultTaskHookEvents();
+  if (eventName === 'onBeforeLaunch') {
+    if (events.includes('onBeforeLaunch') || events.includes('onBeforePrompt')) {
+      return true;
+    }
+    return events.includes('onCodeTabOpen');
+  }
   return events.includes(eventName);
 }
 
@@ -1132,6 +1193,7 @@ function upsertActiveTasks(rootDir, tasks, date) {
       baseBranch: task.baseBranch,
       newBranch: task.newBranch,
       hookEvents: task.hookEvents,
+      meta: isPlainObject(task.meta) ? cloneJsonValue(task.meta) : {},
       sessionId: task.sessionId || '',
       prompt: task.prompt,
       lastDate: date,
@@ -1199,48 +1261,296 @@ function parseFrontMatter(section) {
     throw new Error('Task card is missing YAML front matter');
   }
 
-  const fields = {};
-  let currentListKey = '';
-  for (const rawLine of match[1].split('\n')) {
-    const line = rawLine.replace(/\r$/, '');
-    if (!line.trim()) {
-      continue;
-    }
-    const listItem = line.match(/^\s*-\s*(.+)\s*$/);
-    if (listItem && currentListKey) {
-      if (!Array.isArray(fields[currentListKey])) {
-        fields[currentListKey] = [];
-      }
-      fields[currentListKey].push(listItem[1].trim());
-      continue;
-    }
-    const kv = line.match(/^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)$/);
-    if (!kv) {
-      continue;
-    }
-    const key = kv[1];
-    const value = kv[2];
-    if (value === '') {
-      fields[key] = [];
-      currentListKey = key;
-    } else {
-      fields[key] = stripYamlScalar(value.trim());
-      currentListKey = '';
-    }
-  }
-  return fields;
+  const lines = match[1].split('\n').map((line) => line.replace(/\r$/, ''));
+  const parsed = parseYamlBlock(lines, nextYamlLine(lines, 0), 0);
+  return isPlainObject(parsed.value) ? parsed.value : {};
 }
 
-function stripYamlScalar(value) {
-  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-    return value.slice(1, -1);
+function parseYamlBlock(lines, startIndex, indent) {
+  const start = nextYamlLine(lines, startIndex);
+  if (start >= lines.length) {
+    return { value: {}, next: start };
   }
-  return value;
+
+  const line = lines[start];
+  const currentIndent = countYamlIndent(line);
+  if (line.slice(currentIndent).startsWith('- ')) {
+    return parseYamlList(lines, start, indent);
+  }
+  return parseYamlMap(lines, start, indent);
+}
+
+function parseYamlMap(lines, startIndex, indent) {
+  const value = {};
+  let index = startIndex;
+
+  while (index < lines.length) {
+    index = nextYamlLine(lines, index);
+    if (index >= lines.length) {
+      break;
+    }
+
+    const line = lines[index];
+    const currentIndent = countYamlIndent(line);
+    if (currentIndent < indent) {
+      break;
+    }
+    if (currentIndent > indent) {
+      break;
+    }
+
+    const content = line.slice(indent);
+    if (content.startsWith('- ')) {
+      break;
+    }
+
+    const kv = content.match(/^([A-Za-z][A-Za-z0-9_-]*):(.*)$/);
+    if (!kv) {
+      index += 1;
+      continue;
+    }
+
+    const key = kv[1];
+    const raw = kv[2].trim();
+    if (raw) {
+      value[key] = parseYamlScalar(raw);
+      index += 1;
+      continue;
+    }
+
+    const next = nextYamlLine(lines, index + 1);
+    if (next < lines.length && countYamlIndent(lines[next]) > indent) {
+      const parsed = parseYamlBlock(lines, next, countYamlIndent(lines[next]));
+      value[key] = parsed.value;
+      index = parsed.next;
+      continue;
+    }
+
+    value[key] = '';
+    index += 1;
+  }
+
+  return { value, next: index };
+}
+
+function parseYamlList(lines, startIndex, indent) {
+  const value = [];
+  let index = startIndex;
+
+  while (index < lines.length) {
+    index = nextYamlLine(lines, index);
+    if (index >= lines.length) {
+      break;
+    }
+
+    const line = lines[index];
+    const currentIndent = countYamlIndent(line);
+    if (currentIndent < indent) {
+      break;
+    }
+    if (currentIndent > indent) {
+      break;
+    }
+
+    const content = line.slice(indent);
+    if (!content.startsWith('- ')) {
+      break;
+    }
+
+    const rest = content.slice(2).trim();
+    if (!rest) {
+      const next = nextYamlLine(lines, index + 1);
+      if (next < lines.length && countYamlIndent(lines[next]) > indent) {
+        const parsed = parseYamlBlock(lines, next, countYamlIndent(lines[next]));
+        value.push(parsed.value);
+        index = parsed.next;
+      } else {
+        value.push('');
+        index += 1;
+      }
+      continue;
+    }
+
+    const inlineKv = rest.match(/^([A-Za-z][A-Za-z0-9_-]*):(.*)$/);
+    if (inlineKv) {
+      const item = {};
+      const inlineKey = inlineKv[1];
+      const inlineRaw = inlineKv[2].trim();
+      item[inlineKey] = inlineRaw ? parseYamlScalar(inlineRaw) : '';
+      const next = nextYamlLine(lines, index + 1);
+      if (next < lines.length && countYamlIndent(lines[next]) > indent) {
+        const parsed = parseYamlBlock(lines, next, countYamlIndent(lines[next]));
+        if (isPlainObject(parsed.value)) {
+          Object.assign(item, parsed.value);
+          index = parsed.next;
+        } else {
+          index = parsed.next;
+        }
+      } else {
+        index += 1;
+      }
+      value.push(item);
+      continue;
+    }
+
+    value.push(parseYamlScalar(rest));
+    index += 1;
+  }
+
+  return { value, next: index };
+}
+
+function nextYamlLine(lines, index) {
+  let cursor = index;
+  while (cursor < lines.length) {
+    if (String(lines[cursor] || '').trim()) {
+      break;
+    }
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function countYamlIndent(line) {
+  const match = String(line).match(/^ */);
+  return match ? match[0].length : 0;
+}
+
+function parseYamlScalar(value) {
+  const raw = String(value).trim();
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    return raw.slice(1, -1);
+  }
+  if (raw === 'true') {
+    return true;
+  }
+  if (raw === 'false') {
+    return false;
+  }
+  if (raw === 'null') {
+    return null;
+  }
+  if (/^-?\d+(?:\.\d+)?$/.test(raw)) {
+    return Number(raw);
+  }
+  return raw;
 }
 
 function yamlScalar(value) {
   const str = String(value ?? '');
   return JSON.stringify(str);
+}
+
+function renderYamlMapping(value, indent = 0) {
+  if (!isPlainObject(value)) {
+    return [];
+  }
+
+  const lines = [];
+  for (const [key, item] of Object.entries(value)) {
+    lines.push(...renderYamlEntry(key, item, indent));
+  }
+  return lines;
+}
+
+function renderYamlEntry(key, value, indent) {
+  const prefix = ' '.repeat(indent);
+  if (Array.isArray(value)) {
+    if (!value.length) {
+      return [`${prefix}${key}: []`];
+    }
+    return [
+      `${prefix}${key}:`,
+      ...renderYamlList(value, indent + 2),
+    ];
+  }
+  if (isPlainObject(value)) {
+    if (!Object.keys(value).length) {
+      return [`${prefix}${key}: {}`];
+    }
+    return [
+      `${prefix}${key}:`,
+      ...renderYamlMapping(value, indent + 2),
+    ];
+  }
+  return [`${prefix}${key}: ${yamlInlineScalar(value)}`];
+}
+
+function renderYamlList(values, indent) {
+  const prefix = ' '.repeat(indent);
+  const lines = [];
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      if (!value.length) {
+        lines.push(`${prefix}- []`);
+        continue;
+      }
+      lines.push(`${prefix}-`);
+      lines.push(...renderYamlList(value, indent + 2));
+      continue;
+    }
+    if (isPlainObject(value)) {
+      const entries = Object.entries(value);
+      if (!entries.length) {
+        lines.push(`${prefix}- {}`);
+        continue;
+      }
+      const [firstKey, firstValue] = entries[0];
+      if (isPlainObject(firstValue) || Array.isArray(firstValue)) {
+        lines.push(`${prefix}- ${firstKey}:`);
+        lines.push(...renderYamlNestedValue(firstValue, indent + 4));
+      } else {
+        lines.push(`${prefix}- ${firstKey}: ${yamlInlineScalar(firstValue)}`);
+      }
+      for (const [key, item] of entries.slice(1)) {
+        lines.push(...renderYamlEntry(key, item, indent + 2));
+      }
+      continue;
+    }
+    lines.push(`${prefix}- ${yamlInlineScalar(value)}`);
+  }
+  return lines;
+}
+
+function renderYamlNestedValue(value, indent) {
+  if (Array.isArray(value)) {
+    return renderYamlList(value, indent);
+  }
+  if (isPlainObject(value)) {
+    return renderYamlMapping(value, indent);
+  }
+  return [`${' '.repeat(indent)}${yamlInlineScalar(value)}`];
+}
+
+function yamlInlineScalar(value) {
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (value == null) {
+    return 'null';
+  }
+  return JSON.stringify(String(value));
+}
+
+function cloneJsonValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneJsonValue(item));
+  }
+  if (isPlainObject(value)) {
+    const result = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = cloneJsonValue(item);
+    }
+    return result;
+  }
+  return value;
+}
+
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function updateTaskCardStatus(filePath, status) {
@@ -1294,6 +1604,7 @@ function resolveTask(context, task) {
     newBranch,
     date: context.date,
     recordsDayDir: context.recordsDayDir,
+    codeDir: context.codeDir,
     osRoot: context.osRoot,
     worktreePath,
   };
@@ -1787,6 +2098,7 @@ function launchKittyTab(task, socketAddress, project, { sendPrompt = true, trigg
     MW_OS_ROOT: task.osRoot || '',
     MW_RECORDS_DAY_DIR: task.recordsDayDir || '',
     MW_CODE_DIR: project.codeDir || '',
+    MW_TASK_META_JSON: JSON.stringify(task.meta || {}),
   };
   const shouldResumeSession = trigger === 'restore' && !!task.sessionId;
   const codexCommand = shouldResumeSession
@@ -1822,7 +2134,6 @@ function launchKittyTab(task, socketAddress, project, { sendPrompt = true, trigg
         MW_TAB_TITLE: codexTabTitle,
         MW_SOCKET: socketAddress,
         MW_INITIAL_PROMPT: sendPrompt ? task.prompt : '',
-        MW_HOOK_EVENT: trigger === 'run' && project.hooks.onCodeTabOpen && taskAllowsHook(task, 'onCodeTabOpen') ? 'onCodeTabOpen' : '',
         MW_MAGICWORK_BIN: path.join(__dirname, 'magicwork'),
         MW_REGISTER_SESSION_SCRIPT: REGISTER_SESSION_SCRIPT,
         ...taskEnv,
@@ -1946,6 +2257,8 @@ function runLifecycleHook(hookPath, eventName, task, { logger = () => {} } = {})
       MW_TASK_SLUG: task.slug || '',
       MW_OS_ROOT: task.osRoot || '',
       MW_RECORDS_DAY_DIR: task.recordsDayDir || '',
+      MW_CODE_DIR: task.codeDir || '',
+      MW_TASK_META_JSON: JSON.stringify(task.meta || {}),
     },
     stdio: 'inherit',
   });
@@ -2115,6 +2428,7 @@ function resolveProject(options = {}) {
   const rawCodeDir = options.codeDir || fileConfig.codeDir || '';
   const rawDefaultRepo = options.defaultRepo || fileConfig.defaultRepo || '';
   const rawHooks = {
+    onBeforeLaunch: options.hookOnBeforeLaunch || fileConfig.hooks?.onBeforeLaunch || '',
     onCodeTabOpen: options.hookOnCodeTabOpen || fileConfig.hooks?.onCodeTabOpen || '',
     onClean: options.hookOnClean || fileConfig.hooks?.onClean || '',
   };
@@ -2125,7 +2439,9 @@ function resolveProject(options = {}) {
     recordsDir: rawRecordsDir ? resolveConfiguredPath(rawRecordsDir, osRoot) : '',
     codeDir: rawCodeDir ? resolveConfiguredPath(rawCodeDir, osRoot) : '',
     defaultRepo: rawDefaultRepo ? resolveConfiguredPath(rawDefaultRepo, osRoot) : '',
+    taskTemplate: isPlainObject(fileConfig.taskTemplate) ? cloneJsonValue(fileConfig.taskTemplate) : {},
     hooks: {
+      onBeforeLaunch: rawHooks.onBeforeLaunch ? resolveConfiguredPath(rawHooks.onBeforeLaunch, osRoot) : '',
       onCodeTabOpen: rawHooks.onCodeTabOpen ? resolveConfiguredPath(rawHooks.onCodeTabOpen, osRoot) : '',
       onClean: rawHooks.onClean ? resolveConfiguredPath(rawHooks.onClean, osRoot) : '',
     },
@@ -2206,7 +2522,7 @@ function printHelp() {
     '',
     'Examples:',
     '  mw config show',
-    `  mw config init --os-root ~/.config/magicwork --records-dir ~/magicwork/records --code-dir ~/magicwork/code --default-repo /path/to/repo --hook-on-code-tab-open ${EXAMPLE_HOOK_SCRIPT} --hook-on-clean ${EXAMPLE_HOOK_SCRIPT}`,
+    `  mw config init --os-root ~/.config/magicwork --records-dir ~/magicwork/records --code-dir ~/magicwork/code --default-repo /path/to/repo --hook-on-before-launch ${EXAMPLE_HOOK_SCRIPT} --hook-on-code-tab-open ${EXAMPLE_HOOK_SCRIPT} --hook-on-clean ${EXAMPLE_HOOK_SCRIPT}`,
     '  mw config show',
     '  mw init',
     '  mw init 3',

@@ -359,8 +359,14 @@ workdir: "/path/to/repo"
 baseBranch: "main"
 newBranch: ""
 hooks:
+  - onBeforeLaunch
   - onCodeTabOpen
   - onClean
+workspaceRepos:
+  - source: "git@github.com:your-org/admin-ui.git"
+    dest: ".deps/admin-ui"
+    branch: "main"
+    pull: true
 ---
 
 ```prompt
@@ -379,6 +385,10 @@ Notes:
 - `newBranch` can be left empty for auto-generation
 - `hooks` controls which lifecycle hook events are enabled for that task
 - for example, `hooks: [onClean]` skips the startup hook but keeps cleanup enabled
+- `workspaceRepos` is an optional custom field that can be consumed by your own hook scripts
+- `workspaceRepos[].pull` defaults to `false`; repositories are synced only when you explicitly set `pull: true`
+- `workspaceRepos[].dest` is the final target directory, not a parent directory
+- for example, `dest: ".deps/admin-ui"` clones into `<task-worktree>/.deps/admin-ui`
 
 ## Session Tracking And Restore
 
@@ -416,12 +426,25 @@ This keeps task cards clean while preserving a reliable path back to the origina
 
 The core does not contain project-specific bootstrap logic.
 
+- `hooks.onBeforeLaunch`
+  - runs after the task worktree is created but before any tabs are opened
+  - use it for prerequisites that must finish before environment initialization or prompt delivery
+  - a common example is syncing extra repositories declared in task metadata such as `workspaceRepos`
 - `hooks.onCodeTabOpen`
   - runs when the code/setup tab opens during `run`
-  - runs only when the task card enables `onCodeTabOpen` in `Hooks`
+  - runs after `onBeforeLaunch`
+  - runs only when the task card enables `onCodeTabOpen` in `hooks`
 - `hooks.onClean`
   - runs before worktree and branch cleanup
-  - runs only when the task card enables `onClean` in `Hooks`
+  - runs only when the task card enables `onClean` in `hooks`
+
+Typical launch order in the current implementation:
+
+1. Create the task worktree.
+2. Run `onBeforeLaunch`.
+3. Open the task tabs.
+4. Run `onCodeTabOpen` inside the code/setup tab.
+5. Start the agent and send the initial prompt.
 
 The repository includes a generic example hook:
 
@@ -444,6 +467,8 @@ Hook environment variables include:
 - `MW_TASK_SLUG`
 - `MW_RECORDS_DAY_DIR`
 - `MW_OS_ROOT`
+- `MW_CODE_DIR`
+- `MW_TASK_META_JSON`
 
 ## Agent Sessions And Notifications
 
