@@ -8,6 +8,7 @@ const DEFAULT_SOCKET = 'unix:/tmp/kitty.sock';
 const TEMPLATE_TASK_COUNT = 5;
 const CONFIG_FILE = 'config.json';
 const ACTIVE_STATE_FILE = '.magicwork-active.json';
+const SESSION_STATE_FILE = '.magicwork-sessions.json';
 const RECORDS_DIR = 'records';
 const CODEX_NOTIFY_SCRIPT = path.join(__dirname, 'codex_notify.py');
 const CODEX_WATCHER_SCRIPT = path.join(__dirname, 'kitty_codex_watcher.py');
@@ -47,8 +48,9 @@ function main() {
       case 'report':
         runReport(commandArgs);
         break;
-      case 'sync':
-        runSync(commandArgs);
+      case 'tasks':
+      case 'list':
+        runTasks(commandArgs);
         break;
       case 'config':
         runConfig(commandArgs);
@@ -112,11 +114,10 @@ function runInit(args, { defaultCount = TEMPLATE_TASK_COUNT } = {}) {
     defaultRepo,
     defaultBaseBranch,
   });
-  const indexPath = writeDayIndex(dayDir, date, project.osRoot);
   for (const filePath of createdFiles) {
     console.log(filePath);
   }
-  console.log(indexPath);
+  console.log(dayDir);
 }
 
 function resolveInitCardCount(options) {
@@ -149,12 +150,7 @@ function runLaunch(args) {
     fail(`Task file not found: ${inputPath}`);
   }
 
-  const dayDir = inferDayDirFromTaskPath(inputPath);
-  if (dayDir) {
-    inputPath = writeDayIndex(dayDir, path.basename(dayDir), project.osRoot);
-  }
-
-  const content = fs.readFileSync(inputPath, 'utf8');
+  const content = fs.statSync(inputPath).isDirectory() ? '' : fs.readFileSync(inputPath, 'utf8');
   const context = parseTaskFile(content, inputPath, project);
   if (!context.tasks.length) {
     fail(`No runnable tasks found in ${inputPath}`);
@@ -218,7 +214,6 @@ function runLaunch(args) {
 
   if (!options.dryRun) {
     upsertActiveTasks(project.osRoot, launched, context.date);
-    writeDayIndex(context.recordsDayDir, context.date, project.osRoot);
   }
 }
 
@@ -244,8 +239,8 @@ function runClean(args) {
     fail(`Task file not found: ${inputPath}`);
   }
 
-  const content = fs.readFileSync(inputPath, 'utf8');
-  const context = parseTaskFile(content, inputPath, project);
+  const content = fs.statSync(inputPath).isDirectory() ? '' : fs.readFileSync(inputPath, 'utf8');
+  const context = parseTaskFile(content, inputPath, project, { includeDone: true });
   const tasks = context.tasks.map((task) => resolveTask(context, task));
 
   if (!tasks.length) {
@@ -283,9 +278,6 @@ function runClean(args) {
     console.log(`   removed worktree: ${task.worktreePath}`);
   }
 
-  if (!options.dryRun) {
-    writeDayIndex(context.recordsDayDir, context.date, project.osRoot);
-  }
 }
 
 function runFinish(args) {
@@ -300,7 +292,7 @@ function runFinish(args) {
     fail(`Task file not found: ${inputPath}`);
   }
 
-  const content = fs.readFileSync(inputPath, 'utf8');
+  const content = fs.statSync(inputPath).isDirectory() ? '' : fs.readFileSync(inputPath, 'utf8');
   const context = parseTaskFile(content, inputPath, project);
   const tasks = context.tasks.map((task) => resolveTask(context, task));
 
@@ -315,6 +307,9 @@ function runFinish(args) {
 
   console.log(`finish: using ${inputPath}`);
   console.log(`finish: matched ${targets.length} task(s)`);
+  if (!options.dryRun) {
+    upsertTaskSessions(project.osRoot, targets);
+  }
   for (const task of targets) {
     const summaryPath = taskSummaryPath(task);
     if (options.dryRun) {
@@ -350,9 +345,6 @@ function runFinish(args) {
     console.log(`finish: finished task ${task.index} ${task.name}`);
   }
 
-  if (!options.dryRun) {
-    writeDayIndex(context.recordsDayDir, context.date, project.osRoot);
-  }
 }
 
 function runRestore(args) {
@@ -442,8 +434,8 @@ function runReport(args) {
     fail(`Task file not found: ${inputPath}`);
   }
 
-  const content = fs.readFileSync(inputPath, 'utf8');
-  const context = parseTaskFile(content, inputPath, project);
+  const content = fs.statSync(inputPath).isDirectory() ? '' : fs.readFileSync(inputPath, 'utf8');
+  const context = parseTaskFile(content, inputPath, project, { includeDone: true });
   const tasks = context.tasks.map((task) => resolveTask(context, task));
 
   if (!tasks.length) {
@@ -455,46 +447,139 @@ function runReport(args) {
     fail('No matching worktrees to report');
   }
 
+  console.log(`report: using ${inputPath}`);
+  console.log(`report: matched ${targets.length} task(s)`);
+
+  if (!options.dryRun) {
+    upsertTaskSessions(project.osRoot, targets);
+  }
+
   for (const task of targets) {
-    const recordPath = taskRecordPath(project.recordsDir, task);
+    const summaryPath = taskSummaryPath(task);
     if (options.dryRun) {
       console.log(`${task.index}. ${task.name}`);
-      console.log(`   record: ${recordPath}`);
+      console.log(`   summary: ${summaryPath}`);
       console.log(`   worktree: ${task.worktreePath}`);
       console.log('   mode: dry-run');
       continue;
     }
 
     ensureProjectDirs(project, { records: true, os: true });
+    console.log(`report: start task ${task.index} ${task.name}`);
     if (!hasSummaryContext(task)) {
-      console.log(`${task.index}. ${task.name}`);
-      console.log('   skip: no usable worktree or session record');
+      console.log('report: skip summary, no usable worktree or session record');
       continue;
     }
 
-    ensureDir(path.dirname(recordPath));
+    console.log(`report: writing summary ${summaryPath}`);
+    ensureDir(path.dirname(summaryPath));
     const reportMarkdown = generateTaskReport(task);
-    appendTaskRecord(recordPath, task, reportMarkdown);
+    appendTaskSummary(summaryPath, task, reportMarkdown);
     updateActiveTaskSummary(project.osRoot, task.newBranch, reportMarkdown);
-
-    console.log(`${task.index}. ${task.name}`);
-    console.log(`   record: ${recordPath}`);
-    console.log(`   worktree: ${task.worktreePath}`);
+    console.log(`report: finished task ${task.index} ${task.name}`);
   }
 }
 
-function runSync(args) {
+function runTasks(args) {
   const options = parseOptions(args);
   const project = resolveProject(options);
-  ensureProjectDirs(project, { records: true });
-  const date = options.date || todayLocal();
-  const dayDir = path.join(project.recordsDir, date);
-  if (!fs.existsSync(dayDir)) {
-    fail(`Date directory not found: ${dayDir}`);
+  ensureProjectDirs(project, { records: true, os: true });
+
+  const dayDirs = options.all
+    ? listRecordDayDirs(project.recordsDir)
+    : [path.join(project.recordsDir, options.date || todayLocal())];
+
+  const activeTasks = readActiveTasks(project.osRoot);
+  const activeByBranch = new Map(activeTasks.map((task) => [task.newBranch, task]));
+  const activeBranches = new Set(activeTasks.map((task) => task.newBranch));
+  const archivedByBranch = readTaskSessions(project.osRoot);
+  const groups = [];
+
+  for (const dayDir of dayDirs) {
+    if (!fs.existsSync(dayDir)) {
+      if (options.date) {
+        fail(`Date directory not found: ${dayDir}`);
+      }
+      continue;
+    }
+
+    const date = path.basename(dayDir);
+    const files = listTaskCardFiles(dayDir);
+    const rows = [];
+    for (const filePath of files) {
+      const parsed = parseTaskCard(fs.readFileSync(filePath, 'utf8'), filePath);
+      const task = parsed.task;
+      const activeTask = activeByBranch.get(task.newBranch || '');
+      const sessionId = activeTask?.sessionId || archivedByBranch.get(task.newBranch || '') || '-';
+      const status = task.status === 'done'
+        ? 'done'
+        : !task.prompt
+          ? 'draft'
+          : activeBranches.has(task.newBranch)
+            ? 'active'
+            : task.status === 'doing'
+              ? 'doing'
+              : 'todo';
+      rows.push({
+        index: String(task.index).padStart(2, '0'),
+        status,
+        name: task.name,
+        branch: task.newBranch || '(auto)',
+        sessionId,
+        file: path.relative(dayDir, filePath),
+      });
+    }
+
+    if (rows.length) {
+      groups.push({ date, rows });
+    }
   }
 
-  const indexPath = writeDayIndex(dayDir, date, project.osRoot);
-  console.log(indexPath);
+  if (!groups.length) {
+    console.log('No tasks found');
+    return;
+  }
+
+  const columns = [
+    { key: 'index', title: 'ID' },
+    { key: 'status', title: 'STATUS' },
+    { key: 'name', title: 'NAME' },
+    { key: 'branch', title: 'BRANCH' },
+    { key: 'sessionId', title: 'SESSION' },
+    { key: 'file', title: 'CARD' },
+  ];
+
+  groups.forEach((group, groupIndex) => {
+    const widths = {};
+    for (const column of columns) {
+      widths[column.key] = column.title.length;
+      for (const row of group.rows) {
+        widths[column.key] = Math.max(widths[column.key], String(row[column.key] || '').length);
+      }
+    }
+
+    console.log(group.date);
+    console.log(formatTasksTableRow(columns, widths, Object.fromEntries(columns.map((column) => [column.key, column.title]))));
+    console.log(formatTasksTableSeparator(columns, widths));
+    for (const row of group.rows) {
+      console.log(formatTasksTableRow(columns, widths, row));
+    }
+    if (groupIndex < groups.length - 1) {
+      console.log('');
+    }
+  });
+}
+
+function formatTasksTableRow(columns, widths, row) {
+  return columns
+    .map((column) => String(row[column.key] || '').padEnd(widths[column.key], ' '))
+    .join('  ');
+}
+
+function formatTasksTableSeparator(columns, widths) {
+  return columns
+    .map((column) => '-'.repeat(widths[column.key]))
+    .join('  ');
 }
 
 function runRecordSession(args) {
@@ -514,8 +599,7 @@ function runRecordSession(args) {
   if (!fs.existsSync(dayDir)) {
     fail(`Date directory not found: ${dayDir}`);
   }
-  writeDayIndex(dayDir, date, project.osRoot);
-  console.log(path.join(dayDir, 'index.md'));
+  console.log(dayDir);
 }
 
 function runConfig(args) {
@@ -748,28 +832,23 @@ function resolveDefaultTaskFile(dateArg, recordsDir) {
   if (!fs.existsSync(dayDir)) {
     fail(`Date directory not found: ${dayDir}`);
   }
-
-  const indexPath = path.join(dayDir, 'index.md');
-  if (fs.existsSync(indexPath)) {
-    return indexPath;
-  }
-  fail(`index.md not found in ${dayDir}. Run \`mw sync --date ${date}\`.`);
+  return dayDir;
 }
 
-function parseTaskFile(content, filePath, project) {
-  if (path.basename(filePath) === 'index.md') {
-    return parseTaskCardsFromDayDir(path.dirname(filePath), project);
+function parseTaskFile(content, filePath, project, options = {}) {
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+    return parseTaskCardsFromDayDir(filePath, project, options);
   }
   if (path.dirname(filePath).endsWith(`${path.sep}tasks`)) {
-    return parseSingleTaskCard(content, filePath, project);
+    return parseSingleTaskCard(content, filePath, project, options);
   }
   throw new Error(`Unsupported task file format: ${filePath}`);
 }
 
 function inferDayDirFromTaskPath(filePath) {
   const resolved = path.resolve(filePath);
-  if (path.basename(resolved) === 'index.md') {
-    return path.dirname(resolved);
+  if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+    return fs.existsSync(tasksDir(resolved)) ? resolved : '';
   }
   if (path.dirname(resolved).endsWith(`${path.sep}tasks`)) {
     return path.dirname(path.dirname(resolved));
@@ -777,22 +856,24 @@ function inferDayDirFromTaskPath(filePath) {
   return '';
 }
 
-function parseTaskCardsFromDayDir(dayDir, project) {
+function parseTaskCardsFromDayDir(dayDir, project, options = {}) {
+  const includeDone = !!options.includeDone;
   const dateMatch = dayDir.match(/(\d{4}-\d{2}-\d{2})/);
   const date = dateMatch ? dateMatch[1] : todayLocal();
   const codeDayDir = path.join(project.codeDir, date);
   const activeByBranch = new Map(readActiveTasks(project.osRoot).map((task) => [task.newBranch, task]));
+  const archivedByBranch = readTaskSessions(project.osRoot);
   const tasks = [];
   const files = listTaskCardFiles(dayDir);
 
   for (const filePath of files) {
     const content = fs.readFileSync(filePath, 'utf8');
     const parsed = parseTaskCard(content, filePath);
-    if (isTaskRunnable(parsed.task)) {
+    if (isTaskSelectable(parsed.task, { includeDone })) {
       const activeTask = activeByBranch.get(parsed.task.newBranch || '');
       tasks.push({
         ...parsed.task,
-        sessionId: activeTask?.sessionId || '',
+        sessionId: activeTask?.sessionId || archivedByBranch.get(parsed.task.newBranch || '') || '',
       });
     }
   }
@@ -800,13 +881,15 @@ function parseTaskCardsFromDayDir(dayDir, project) {
   return { date, recordsDayDir: dayDir, codeDayDir, osRoot: project.osRoot, defaultRepo: project.defaultRepo || '', tasks };
 }
 
-function parseSingleTaskCard(content, filePath, project) {
+function parseSingleTaskCard(content, filePath, project, options = {}) {
+  const includeDone = !!options.includeDone;
   const dayDir = path.dirname(path.dirname(filePath));
   const dateMatch = dayDir.match(/(\d{4}-\d{2}-\d{2})/);
   const date = dateMatch ? dateMatch[1] : todayLocal();
   const codeDayDir = path.join(project.codeDir, date);
   const parsed = parseTaskCard(content, filePath);
   const activeByBranch = new Map(readActiveTasks(project.osRoot).map((task) => [task.newBranch, task]));
+  const archivedByBranch = readTaskSessions(project.osRoot);
   const activeTask = activeByBranch.get(parsed.task.newBranch || '');
   return {
     date,
@@ -814,9 +897,9 @@ function parseSingleTaskCard(content, filePath, project) {
     codeDayDir,
     osRoot: project.osRoot,
     defaultRepo: project.defaultRepo || '',
-    tasks: isTaskRunnable(parsed.task) ? [{
+    tasks: isTaskSelectable(parsed.task, { includeDone }) ? [{
       ...parsed.task,
-      sessionId: activeTask?.sessionId || '',
+      sessionId: activeTask?.sessionId || archivedByBranch.get(parsed.task.newBranch || '') || '',
     }] : [],
   };
 }
@@ -862,6 +945,18 @@ function normalizePromptContent(value) {
 
 function isTaskRunnable(task) {
   return task.status !== 'done' && !!String(task.prompt || '').trim();
+}
+
+function isTaskSelectable(task, options = {}) {
+  const includeDone = !!options.includeDone;
+  const hasPrompt = !!String(task.prompt || '').trim();
+  if (!hasPrompt) {
+    return false;
+  }
+  if (task.status === 'done' && !includeDone) {
+    return false;
+  }
+  return true;
 }
 
 function defaultTaskHookEvents() {
@@ -910,67 +1005,23 @@ function listTaskCardFiles(dayDir) {
     .map((entry) => path.join(dirPath, entry));
 }
 
-function writeDayIndex(dayDir, date, osRoot) {
-  ensureDir(tasksDir(dayDir));
-  const files = listTaskCardFiles(dayDir);
-  const activeTasks = readActiveTasks(osRoot);
-  const activeByBranch = new Map(activeTasks.map((task) => [task.newBranch, task]));
-  const activeBranches = new Set(activeTasks.map((task) => task.newBranch));
-  const entries = files.map((filePath) => {
-    const parsed = parseTaskCard(fs.readFileSync(filePath, 'utf8'), filePath);
-    const task = parsed.task;
-    const activeTask = activeByBranch.get(task.newBranch || '');
-    const status = task.status === 'done'
-      ? 'done'
-      : !task.prompt
-      ? 'draft'
-      : activeBranches.has(task.newBranch)
-        ? 'active'
-        : task.status === 'doing'
-          ? 'doing'
-          : 'todo';
-    return {
-      index: task.index,
-      name: task.name,
-      status,
-      branch: task.newBranch || '(auto)',
-      sessionId: activeTask?.sessionId || '',
-      file: path.relative(dayDir, filePath),
-    };
-  });
-
-  const content = buildDayIndex(date, entries);
-  const indexPath = path.join(dayDir, 'index.md');
-  fs.writeFileSync(indexPath, content, 'utf8');
-  return indexPath;
-}
-
-function buildDayIndex(date, entries) {
-  const lines = [
-    `# Daily Workflow ${date}`,
-    '',
-    '## Tasks',
-    '',
-  ];
-
-  if (!entries.length) {
-    lines.push('- No task cards yet.');
-  } else {
-    for (const entry of entries) {
-      lines.push(`- ${String(entry.index).padStart(2, '0')} | ${entry.status} | ${entry.name} | ${entry.branch} | ${entry.sessionId || '-'} | ${entry.file}`);
-    }
+function listRecordDayDirs(recordsDir) {
+  if (!fs.existsSync(recordsDir)) {
+    return [];
   }
 
-  lines.push('');
-  lines.push('## Notes');
-  lines.push('');
-  lines.push('- Edit files in `tasks/` and run `mw sync --date YYYY-MM-DD` to rebuild this index.');
-  lines.push('');
-  return lines.join('\n');
+  return fs.readdirSync(recordsDir)
+    .filter((entry) => /^\d{4}-\d{2}-\d{2}$/.test(entry))
+    .sort()
+    .map((entry) => path.join(recordsDir, entry));
 }
 
 function activeStatePath(rootDir) {
   return path.join(rootDir, ACTIVE_STATE_FILE);
+}
+
+function sessionStatePath(rootDir) {
+  return path.join(rootDir, SESSION_STATE_FILE);
 }
 
 function readActiveTasks(rootDir) {
@@ -1010,6 +1061,66 @@ function writeActiveTasks(rootDir, tasks) {
   fs.writeFileSync(statePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
 }
 
+function readTaskSessions(rootDir) {
+  const statePath = sessionStatePath(rootDir);
+  if (!fs.existsSync(statePath)) {
+    return new Map();
+  }
+
+  const raw = fs.readFileSync(statePath, 'utf8').trim();
+  if (!raw) {
+    return new Map();
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Failed to parse ${statePath}`);
+  }
+
+  const sessions = parsed && typeof parsed.sessions === 'object' && parsed.sessions
+    ? parsed.sessions
+    : {};
+  return new Map(
+    Object.entries(sessions).filter(([branchName, sessionId]) => {
+      return typeof branchName === 'string' && typeof sessionId === 'string' && branchName && sessionId;
+    }),
+  );
+}
+
+function writeTaskSessions(rootDir, sessionsMap) {
+  const statePath = sessionStatePath(rootDir);
+  const sessions = Object.fromEntries(
+    Array.from(sessionsMap.entries()).sort(([left], [right]) => left.localeCompare(right)),
+  );
+  const payload = {
+    updatedAt: new Date().toISOString(),
+    sessions,
+  };
+  fs.writeFileSync(statePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
+
+function upsertTaskSessions(rootDir, tasks) {
+  const nextSessions = readTaskSessions(rootDir);
+  let changed = false;
+
+  for (const task of tasks) {
+    if (!task || !task.newBranch || !task.sessionId) {
+      continue;
+    }
+    if (nextSessions.get(task.newBranch) === task.sessionId) {
+      continue;
+    }
+    nextSessions.set(task.newBranch, task.sessionId);
+    changed = true;
+  }
+
+  if (changed) {
+    writeTaskSessions(rootDir, nextSessions);
+  }
+}
+
 function upsertActiveTasks(rootDir, tasks, date) {
   const existing = readActiveTasks(rootDir);
   const byBranch = new Map(existing.map((task) => [task.newBranch, task]));
@@ -1028,6 +1139,7 @@ function upsertActiveTasks(rootDir, tasks, date) {
   }
 
   writeActiveTasks(rootDir, Array.from(byBranch.values()));
+  upsertTaskSessions(rootDir, tasks);
 }
 
 function removeActiveTasks(rootDir, branchNames) {
@@ -1074,6 +1186,10 @@ function updateActiveTaskSession(rootDir, branchName, sessionId) {
 
   if (changed) {
     writeActiveTasks(rootDir, nextTasks);
+  }
+
+  if (sessionId) {
+    upsertTaskSessions(rootDir, [{ newBranch: branchName, sessionId }]);
   }
 }
 
@@ -2081,11 +2197,11 @@ function printHelp() {
     '  init [--date YYYY-MM-DD]     Create a daily Markdown task template',
     '  add [--date YYYY-MM-DD]      Append more task cards for the day',
     '  run [file] [--date ...]      Create worktrees and launch task workspaces',
-    '  sync [--date YYYY-MM-DD]     Rebuild index.md from task cards',
     '  restore [targets...]         Reopen active task workspaces without init or prompt',
     '  clean [file] [targets...]    Remove worktrees and their branches',
     '  finish [file] [targets...]   Summarize, mark done, and clean tasks',
-    '  report [file] [targets...]   Summarize task progress into records/',
+    '  report [file] [targets...]   Append task progress into daily summaries/',
+    '  tasks [--date YYYY-MM-DD]    List tasks with session ids for today by default',
     '  config [show|init]           Show or create config in osRoot',
     '',
     'Examples:',
@@ -2098,7 +2214,6 @@ function printHelp() {
     '  mw add',
     '  mw add 3',
     '  mw init --no-carry-active',
-    '  mw sync --date 2026-04-18',
     '  mw run',
     '  mw run 3',
     '  mw run 1 3 5',
@@ -2115,7 +2230,10 @@ function printHelp() {
     '  mw clean --all',
     '  mw report 1',
     '  mw report --all',
-    '  mw run ~/magicwork/records/2026-04-18/index.md',
+    '  mw tasks',
+    '  mw tasks --date 2026-04-18',
+    '  mw tasks --all',
+    '  mw run ~/magicwork/records/2026-04-18',
   ].join('\n'));
 }
 

@@ -27,11 +27,10 @@ Product goal:
 Core design:
 - Separate these paths clearly:
   - osRoot: config and runtime state only
-  - recordsDir: task cards, daily index, summaries
+  - recordsDir: task cards and summaries
   - codeDir: generated worktrees only
 - recordsDir and codeDir must be explicitly configured.
 - Use one Markdown card per task as the source of truth.
-- Generate an index.md for each day from those task cards.
 - Carry unfinished active tasks into the next day by default.
 
 Development constraints:
@@ -46,8 +45,6 @@ Required behavior:
   - create the date folder if missing
   - create 5 new task cards every time it runs
   - if the day already exists, append instead of overwriting
-- `sync`
-  - rebuild index.md from task cards
 - `run`
   - create worktrees and launch one terminal workspace per task
   - by default only launch tasks that have not been launched before
@@ -126,7 +123,6 @@ Implementation preferences:
 - Maps each task to its own git branch and git worktree.
 - Launches one terminal workspace per task.
 - Tracks active tasks and saved session ids outside the task cards.
-- Rebuilds a daily `index.md` from task cards.
 - Restores active workspaces later without re-sending the initial prompt.
 - Generates task summaries during `finish`, unless you explicitly skip them with `--no-summary`.
 - Supports project-specific bootstrap and cleanup through lifecycle hooks.
@@ -158,7 +154,6 @@ Each day under `recordsDir` looks like this:
 
 ```text
 YYYY-MM-DD/
-  index.md
   tasks/
     01-task-1.md
     02-task-2.md
@@ -174,9 +169,6 @@ Meaning:
 - `tasks/*.md`
   - source of truth
   - edited by you
-- `index.md`
-  - generated overview
-  - includes status and session id when available
 - `summaries/*.md`
   - generated task summaries
   - appended by `report` or `finish`
@@ -301,12 +293,6 @@ mw init
 
 Running `mw init` again on the same day appends 5 more task cards.
 
-Rebuild the daily index:
-
-```bash
-mw sync --date 2026-04-18
-```
-
 Launch today’s tasks:
 
 ```bash
@@ -321,10 +307,10 @@ By default, `mw run` launches only tasks that have not been launched before. To 
 mw run --rerun-launched
 ```
 
-You can also point to a specific index or task card:
+You can also point to a specific day directory or task card:
 
 ```bash
-mw run /path/to/records/2026-04-18/index.md
+mw run /path/to/records/2026-04-18
 mw run /path/to/records/2026-04-18/tasks/01-task-1.md
 ```
 
@@ -399,7 +385,6 @@ Notes:
 MagicWork treats task cards as static configuration and keeps runtime state elsewhere.
 
 - Active task state is stored under `osRoot`
-- `index.md` shows the current `sessionId` when available
 - `restore` resumes the saved session if the current agent supports session resume
 - Summaries are generated from the original agent session history referenced by `sessionId`
 
