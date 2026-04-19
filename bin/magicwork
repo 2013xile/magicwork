@@ -1778,7 +1778,7 @@ function generateTaskSummary(task) {
   const useWorktree = hasUsableWorktree(task);
   const prompt = [
     useWorktree
-      ? 'Review the current repository state and the Codex conversation record, then write a concise task summary in Markdown.'
+      ? 'Review the Codex conversation record as the primary source, and use the current repository state only as supporting context. Then write a concise task summary in Markdown.'
       : 'Review the Codex conversation record only, then write a concise task summary in Markdown.',
     `Task session id: ${task.sessionId || '(missing)'}`,
     conversationContext
@@ -1786,17 +1786,25 @@ function generateTaskSummary(task) {
       : useWorktree
         ? `No Codex conversation record is available. Continue using only the repository state for ${task.worktreePath}.`
         : 'No Codex conversation record is available.',
+    conversationContext
+      ? 'The summary should mainly reflect the interaction between the user and the AI: what the user asked for, what the AI proposed or tried, what feedback or corrections happened, what decisions were made, and where the task currently stands.'
+      : 'No conversation record is available, so summarize from repository state only.',
     'Use exactly these sections and nothing else:',
     '### Summary',
     '- bullet points only',
+    '- focus on the conversation flow, not just the final repository state',
+    '- include important user requests, AI attempts, course corrections, confirmations, blockers, and outcomes',
     '### Files',
     '- bullet points only, use file paths',
+    '- include only files that were clearly changed, discussed, or inspected',
     '### Decisions',
     '- bullet points only',
+    '- capture agreements, clarified constraints, tradeoffs, and changes in direction that emerged during the conversation',
     '### Next',
     '- bullet points only',
+    '- describe the next step in the user/AI workflow, not just generic engineering follow-up',
     useWorktree
-      ? 'Focus on what was attempted, what changed, validation status, blockers, and what should happen next.'
+      ? 'If repository state conflicts with the conversation, prefer the conversation for describing intent and process, and use repository state only to confirm concrete file changes or validation.'
       : 'Focus on what was attempted, decisions made, validation mentioned in the conversation, blockers, and what should happen next. If files cannot be confirmed from the conversation, say so briefly in the Files section.',
   ].join('\n');
 
@@ -1843,7 +1851,7 @@ function generateTaskReport(task) {
   const useWorktree = hasUsableWorktree(task);
   const prompt = [
     useWorktree
-      ? 'Review the current repository state and the Codex conversation record, then write a concise task progress report in Markdown.'
+      ? 'Review the Codex conversation record as the primary source, and use the current repository state only as supporting context. Then write a concise task progress report in Markdown.'
       : 'Review the Codex conversation record only, then write a concise task progress report in Markdown.',
     `Task session id: ${task.sessionId || '(missing)'}`,
     conversationContext
@@ -1851,15 +1859,21 @@ function generateTaskReport(task) {
       : useWorktree
         ? 'No Codex conversation record is available, so rely on repository state only.'
         : 'No Codex conversation record is available.',
+    conversationContext
+      ? 'The report should mainly reflect the user/AI exchange so far: requests, attempts, corrections, confirmed findings, and the current state of the task.'
+      : 'No conversation record is available, so summarize from repository state only.',
     'Use exactly these sections and nothing else:',
     '### Summary',
     '- bullet points only',
+    '- focus on conversation-driven progress, not just code state',
     '### Files',
     '- bullet points only, use file paths',
+    '- include only files that were clearly changed, discussed, or inspected',
     '### Next',
     '- bullet points only',
+    '- describe the immediate next step in the interaction and execution flow',
     useWorktree
-      ? 'Focus on the current worktree status, recent code changes, validation status, blockers, and immediate next steps.'
+      ? 'Prefer the conversation when describing progress and intent; use repository state only to support concrete file or validation details.'
       : 'Focus on the current progress described in the conversation, mentioned changes, validation status, blockers, and immediate next steps. If files cannot be confirmed from the conversation, say so briefly in the Files section.',
   ].join('\n');
 
